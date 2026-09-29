@@ -1,0 +1,15 @@
+// 顶层构建文件。版本组合沿用 KhronosGroup/Vulkan-Tutorial 的 Android 工程，
+// 该组合已被官方验证可用：AGP 8.11.0 + Gradle 9.5.1 + NDK 28.1 + CMake 4.0.2+。
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.11.0'
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+}

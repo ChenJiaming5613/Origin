@@ -1,0 +1,16 @@
+build/
+# CLion 默认的构建目录命名（cmake-build-debug / cmake-build-release ...）
+cmake-build-*/
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+
+.idea/
+.vs/
+.vscode/
+*.iml
+CMakeUserPresets.json
+
+assets/shaders/*.spv

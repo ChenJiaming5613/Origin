@@ -1,0 +1,80 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace "com.origin.app"
+
+    // SDL3 的 README-android.md 要求 Android SDK 35 或更高
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.origin.app"
+
+        // SDL3 自身支持到 API 21；这里用 24 是为了 Vulkan 的设备基线
+        minSdk 24
+        targetSdk 36
+        versionCode 1
+        versionName "1.0"
+
+        externalNativeBuild {
+            cmake {
+                // 只编 arm64-v8a 以缩短构建时间。
+                // 注意：改用 SDL 源码编译（不再用预编译 AAR）后，每个 ABI 都要
+                // 完整编一遍 SDL3，首次构建明显变慢，所以更没必要开四个 ABI。
+                // 需要跑 x86_64 模拟器时再加进来。
+                abiFilters = ['arm64-v8a']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            debuggable true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    externalNativeBuild {
+        cmake {
+            // 指向仓库根的 CMakeLists.txt —— 与 Windows 构建共用同一份。
+            // 路径相对本文件所在的 android/app/ 目录。
+            path "../../CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    ndkVersion "27.3.13750724"
+
+    sourceSets {
+        main {
+            // SDL 的 Java 胶水层直接从 submodule 引用，不往本工程拷贝文件。
+            // AndroidManifest 里声明的 org.libsdl.app.SDLActivity 就来自这里。
+            java.srcDirs += ['../../third_party/SDL/android-project/app/src/main/java']
+
+            // 共享 assets：Windows 构建读的是同一份目录
+            assets.srcDirs = ['../../assets']
+        }
+    }
+}
+
+dependencies {
+    // 无第三方依赖。
+    //
+    // 改用 git submodule 后不再需要 SDL3 的 AAR：
+    //   - native 部分由顶层 CMakeLists 的 add_subdirectory(third_party/SDL)
+    //     编译出 libSDL3.so，AGP 会自动打包 CMake 产出的所有 .so
+    //   - Java 部分由上面的 sourceSets.java.srcDirs 直接引用 submodule 源码
+    // 因此 buildFeatures.prefab 也不再需要（那是给 AAR 里的预编译库用的）。
+    //
+    // 另外本工程不需要 androidx.appcompat：
+    // SDLActivity 继承 android.app.Activity，零 androidx 依赖。
+}

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 基于 SDL3 官方 android-project 模板裁剪而来。
+     Activity 上那几个属性不是可选的装饰：SDLActivity 依赖
+     launchMode/configChanges 的具体取值来正确处理生命周期与配置变更，
+     改动前请先读 SDL 的 README-android.md。 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:versionCode="1"
+    android:versionName="1.0"
+    android:installLocation="auto">
+
+    <!-- 声明需要 Vulkan 1.0.3。required=true 让不支持 Vulkan 的设备
+         在商店侧被过滤，避免装上去黑屏。0x400003 = VK_MAKE_VERSION(1,0,3) -->
+    <uses-feature
+        android:name="android.hardware.vulkan.version"
+        android:version="0x400003"
+        android:required="true" />
+    <uses-feature
+        android:name="android.hardware.vulkan.level"
+        android:version="0"
+        android:required="true" />
+
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <application
+        android:label="@string/app_name"
+        android:allowBackup="false"
+        android:hardwareAccelerated="true"
+        android:enableOnBackInvokedCallback="false"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+
+        <!-- 直接使用 AAR 中的 org.libsdl.app.SDLActivity，因此本工程零 Java 文件。
+             SDLActivity 继承的是 android.app.Activity，不依赖任何 androidx，
+             所以既不需要 appcompat 依赖，也不受 Theme.AppCompat 主题约束。
+
+             SDLActivity.getLibraries() 默认返回 {"SDL3", "main"}，
+             这就是 CMake 目标必须命名为 main（产出 libmain.so）的原因。
+             若要改库名或加自定义逻辑，需自建一个继承 SDLActivity 的 Java 类并重写该方法。 -->
+        <activity
+            android:name="org.libsdl.app.SDLActivity"
+            android:label="@string/app_name"
+            android:alwaysRetainTaskState="true"
+            android:launchMode="singleInstance"
+            android:configChanges="layoutDirection|locale|grammaticalGender|fontScale|fontWeightAdjustment|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:preferMinimalPostProcessing="true"
+            android:screenOrientation="portrait"
+            android:exported="true">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
