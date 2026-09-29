@@ -19,6 +19,32 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # =============================================================================
+# Android：16 KB 页面对齐
+# =============================================================================
+# Android 15 起有设备使用 16 KB 内存页，要求 .so 的 LOAD 段按 16384 对齐。
+# 自 2025-11-01 起，提交到 Google Play 且 targetSdk >= 35 的应用必须满足这一点。
+#
+# NDK r28 及以上默认就是 16 KB 对齐；r27 及以下默认 4096，必须显式加链接器标志。
+# 本工程锁的是 NDK 27.3（r27d），所以这里必须加。
+#
+# 关键：用目录作用域的 add_link_options() 而不是 target_link_options()。
+# 因为需要对齐的不只是我们自己的 libmain.so，还有 third_party/SDL 通过
+# add_subdirectory 产出的 libSDL3.so —— 官方文档给的 target_link_options 示例
+# 只作用于单个 target，用它会漏掉所有 submodule 里的共享库。
+# add_link_options 会被本目录之后添加的所有子目录继承，覆盖面刚好。
+#
+# ⚠️ 必须放在任何 add_subdirectory() 之前，否则先添加的子目录拿不到该标志。
+#
+# 自查（Align 列应为 0x4000）：
+#   llvm-readelf --program-headers libSDL3.so | grep LOAD
+if(ANDROID)
+    add_link_options(
+        "-Wl,-z,max-page-size=16384"
+        "-Wl,-z,common-page-size=16384"
+    )
+endif()
+
+# =============================================================================
 # 三方库（git submodule）
 # =============================================================================
 set(ORIGIN_THIRD_PARTY "${CMAKE_CURRENT_SOURCE_DIR}/third_party")

@@ -19,6 +19,7 @@
 #include <cstddef>  // offsetof
 #include <cstring>
 #include <limits>
+#include <utility>  // std::swap
 
 namespace origin {
 namespace {
@@ -495,15 +496,44 @@ void VulkanRenderer::createSwapchain() {
         imageCount = caps.maxImageCount;
     }
 
-    // Android 特有的 pre-rotation：
-    // preTransform 与 currentTransform 不一致时，合成器会替你做一次全屏旋转，
-    // 在移动 GPU 上是实打实的带宽与功耗浪费。正确做法是设成 currentTransform
-    // 并在顶点着色器里自己补偿。本工程 Manifest 锁了 portrait，
-    // 因此 currentTransform 正常是 IDENTITY，不需要补偿。
-    swapchainTransform_ = caps.currentTransform;
-    if (swapchainTransform_ != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
-        spdlog::warn("surface currentTransform = 0x{:x}，非 IDENTITY。"
-                     "解除竖屏锁定后需要在顶点着色器中补偿旋转",
+    // ---- Android 转屏：preTransform 与 imageExtent 必须成套选择 --------------
+    //
+    // caps.currentTransform 表示「把 app surface 的内容映射到屏幕物理朝向」
+    // 所需的旋转。竖屏 app 跑在竖屏手机上是 IDENTITY，转成横屏后变为
+    // ROTATE_90 / ROTATE_270。
+    //
+    // 只有两种合法组合，**不能混搭**：
+    //
+    //   A. preTransform = IDENTITY          + imageExtent = currentExtent
+    //      按 surface 的当前朝向渲染，旋转交给 Android 合成器。
+    //      代价：一次全屏合成 pass（SurfaceFlinger 要读整个 framebuffer）。
+    //      好处：所有内容（含 ImGui）自动跟随屏幕方向，零额外代码。
+    //
+    //   B. preTransform = currentTransform  + imageExtent = 设备 identity 分辨率
+    //      即 currentTransform 含 90/270 时把 currentExtent 的宽高**对调**，
+    //      再在 MVP 左乘一个 clip space 旋转自行补偿。
+    //      这是移动端性能最优解（官方 pre-rotation 文档推荐）。
+    //
+    // 之前的实现混搭成了 preTransform = currentTransform + imageExtent =
+    // currentExtent —— 呈现引擎会按「已旋转」的尺寸去解释一张未旋转的图像，
+    // 表现就是转屏后画面被拉伸。这就是那个 bug 的根因。
+    //
+    // 这里默认走 A。选它不是因为 A 更优，而是 B 会把 ImGui 一起转歪：
+    // imgui_impl_vulkan 在内部自建正交矩阵、并自己调 vkCmdSetViewport，
+    // 拿不到我们的 pre-rotation 矩阵。等调试面板不再需要时可切到 B ——
+    // 下面 recordCommandBuffer 里的补偿代码已经写好，改这里一行即可。
+    if ((caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0) {
+        swapchainTransform_ = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    } else {
+        // Android 实现理论上必然支持 IDENTITY，走到这里说明遇到了异常驱动。
+        // 退回方案 B：宽高对调 + MVP 补偿（3D 内容正确，ImGui 会转歪）。
+        swapchainTransform_ = caps.currentTransform;
+        if ((swapchainTransform_ & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR |
+                                    VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)) != 0) {
+            std::swap(swapchainExtent_.width, swapchainExtent_.height);
+        }
+        spdlog::warn("surface 不支持 IDENTITY transform，回退 pre-rotation 路径"
+                     "（currentTransform = 0x{:x}），ImGui 面板会随之转向",
                      static_cast<uint32_t>(swapchainTransform_));
     }
 
@@ -964,14 +994,46 @@ void VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageInde
     const glm::mat4 view =
         glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -3.0f));
 
-    const float aspect = static_cast<float>(swapchainExtent_.width) /
-                         static_cast<float>(swapchainExtent_.height);
+    // 转屏补偿。走默认的 IDENTITY 路径时 rotateDeg 恒为 0、下面的旋转整段跳过，
+    // 所以这段对桌面端和默认 Android 路径都是零开销；只有 createSwapchain
+    // 退回 pre-rotation 路径时才生效。
+    //
+    // 两点都要处理，漏一个就出问题：
+    //   1. framebuffer 是设备 identity 朝向的，可见宽高比要用**对调后**的值，
+    //      否则横屏时 cube 会被压扁；
+    //   2. clip space 里补一次 Z 轴旋转，否则画面躺倒。
+    float fbWidth  = static_cast<float>(swapchainExtent_.width);
+    float fbHeight = static_cast<float>(swapchainExtent_.height);
+    float rotateDeg = 0.0f;
+    switch (swapchainTransform_) {
+        case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:
+            rotateDeg = 90.0f;
+            std::swap(fbWidth, fbHeight);
+            break;
+        case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR:
+            rotateDeg = 180.0f;
+            break;
+        case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR:
+            rotateDeg = 270.0f;
+            std::swap(fbWidth, fbHeight);
+            break;
+        default:
+            break;
+    }
+    const float aspect = fbWidth / fbHeight;
 
     // GLM_FORCE_DEPTH_ZERO_TO_ONE 已由 CMake 传入，所以这里产出的是 Vulkan
     // 需要的 [0,1] 深度。但 glm 不管 Y 方向，还要手动翻一下 ——
     // Vulkan 的 NDC 里 Y 朝下，不翻的话画面上下颠倒。
     glm::mat4 proj = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 100.0f);
     proj[1][1] *= -1.0f;
+
+    if (rotateDeg != 0.0f) {
+        // 左乘：等价于官方文档写的 MVP = pre_rotate * MVP
+        proj = glm::rotate(glm::mat4(1.0f), glm::radians(rotateDeg),
+                           glm::vec3(0.0f, 0.0f, 1.0f)) *
+               proj;
+    }
 
     CubePushConstants pc{};
     pc.mvp = proj * view * model;
@@ -1267,6 +1329,47 @@ void VulkanRenderer::initImGui() {
     // Android 上当前工作目录也不一定可写。
     io.IniFilename = nullptr;
 
+    // ---- DPI 自适应 ---------------------------------------------------------
+    // 不做缩放的话面板在手机上只有指甲盖大小：ImGui 的默认尺寸是按约 96 DPI
+    // 的桌面显示器定的，而手机的 density 通常是 2.5x ~ 3.5x。
+    //
+    // 缩放系数取自 SDL_GetWindowDisplayScale()，而不是 Android 的
+    // AConfiguration_getDensity() —— SDL 已经把 Java 侧的
+    // DisplayMetrics.density 填进了 display->content_scale
+    // （见 SDL_androidvideo.c: display->content_scale = Android_ScreenDensity），
+    // 所以这段代码在 Windows 和 Android 上是同一份，不需要平台分支，
+    // 也不用为了拿密度去 include <android/configuration.h>。
+    //
+    // 参考的 Vulkan-glTF-PBR 用的是
+    //   scale = screenDensity / ACONFIGURATION_DENSITY_MEDIUM   // 即 dpi / 160
+    // 与 SDL 给出的 density 是同一个量，只是它必须走 Android 专用头。
+    float dpiScale = SDL_GetWindowDisplayScale(window_);
+    if (!(dpiScale > 0.0f)) {
+        dpiScale = 1.0f;  // 查询失败/返回 0 时不缩放，至少不会把 UI 缩没
+    }
+    uiDpiScale_ = dpiScale;
+
+    ImGuiStyle& style = ImGui::GetStyle();
+
+    // ScaleAllSizes 就地放大 padding / 圆角 / 滚动条宽度等全部几何量。
+    // 它是**累积**的（对同一个 style 调两次就放大两次），所以只能在这里调一次，
+    // 不能放进每帧的 buildUi()。
+    style.ScaleAllSizes(dpiScale);
+
+    // 字体缩放。1.92 起 io.FontGlobalScale 已废弃，拆成两级：
+    //   FontScaleDpi  —— 显示器 DPI，由程序按设备算出（就是这里）
+    //   FontScaleMain —— 用户偏好，留给面板上的滑条
+    // 默认字体 ProggyClean 是以 TTF 形式内嵌的，1.92 的动态字体系统会按实际
+    // 像素大小重新光栅化，所以放大后是清晰的，不会变成马赛克 ——
+    // 这也是不必像 glTF-PBR 那样额外打包一个 Roboto-Medium.ttf 的原因。
+    style.FontScaleDpi = dpiScale;
+
+    // 触摸屏上手指比鼠标钝得多，给控件命中区留额外余量。
+    // 注意这个值要自己乘 dpiScale：上面的 ScaleAllSizes 已经执行过了。
+    if (dpiScale > 1.5f) {
+        style.TouchExtraPadding = ImVec2(4.0f * dpiScale, 4.0f * dpiScale);
+    }
+
     if (!ImGui_ImplSDL3_InitForVulkan(window_)) {
         throw std::runtime_error("ImGui_ImplSDL3_InitForVulkan 失败");
     }
@@ -1304,7 +1407,8 @@ void VulkanRenderer::initImGui() {
     }
 
     imguiReady_ = true;
-    spdlog::info("ImGui {} 已初始化（SDL3 + Vulkan 后端，volk 模式）", IMGUI_VERSION);
+    spdlog::info("ImGui {} 已初始化（SDL3 + Vulkan 后端，volk 模式），DPI 缩放 {:.2f}x",
+                 IMGUI_VERSION, uiDpiScale_);
 }
 
 void VulkanRenderer::shutdownImGui() {
@@ -1322,8 +1426,11 @@ void VulkanRenderer::buildUi() {
     // 直接写中文会渲染成方框。要中文界面得额外加一个 TTF 资源 +
     // ImFontGlyphRangesBuilder，且 Android 侧还要把字体打进 APK，
     // 对一个调试面板来说不划算。
-    ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(330.0f, 0.0f), ImGuiCond_FirstUseEver);
+    // 位置和宽度必须乘 DPI 系数：ScaleAllSizes 只管 style 里的几何量，
+    // 管不到这里手写的绝对像素值 —— 漏乘的话手机上面板会挤在角落且过窄。
+    const float s = uiDpiScale_;
+    ImGui::SetNextWindowPos(ImVec2(16.0f * s, 16.0f * s), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330.0f * s, 0.0f), ImGuiCond_FirstUseEver);
 
     if (ImGui::Begin("Origin")) {
         ImGui::Text("%.2f ms  (%.0f FPS)", frameMs_,
@@ -1345,6 +1452,14 @@ void VulkanRenderer::buildUi() {
         if (ImGui::Button("Screenshot -> origin_shot.png")) {
             requestScreenshot("origin_shot.png");
         }
+
+        // 设备上再微调字号。FontScaleDpi 已经按屏幕密度自动设好，这一项是
+        // 叠加在它之上的用户偏好（style.FontScaleMain），改完立即生效 ——
+        // 1.92 的字体是动态光栅化的，不需要重建字体图集。
+        ImGui::SeparatorText("UI");
+        ImGui::SliderFloat("Font scale", &ImGui::GetStyle().FontScaleMain, 0.5f, 3.0f,
+                           "%.2fx");
+        ImGui::Text("auto DPI scale: %.2fx", uiDpiScale_);
 
         ImGui::SeparatorText("Reflected layout");
         ImGui::Text("push constant: %u bytes", program_.pushConstantSize);

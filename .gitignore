@@ -14,3 +14,16 @@ android/local.properties
 CMakeUserPresets.json
 
 assets/shaders/*.spv
+
+# Khronos glTF-Sample-Assets（本地参考素材，约 3 GB，自带 .git 是个嵌套仓库）
+#
+# 刻意不纳入版本管理：本仓库的 .gitattributes 把 *.png/*.jpg/*.bin/*.glb
+# 都配成了 git-lfs，而这个目录里有 1500+ 个命中该规则的文件。
+# GitHub 免费账户的 LFS 配额是 1 GB 存储 + 1 GB/月流量，推上去必然失败；
+# 且 GitHub 对单个非 LFS 文件有 100 MB 硬上限。
+#
+# 若确实需要让协作者拿到同一份素材，正确做法是登记成 submodule 而不是直接提交：
+#   git submodule add https://github.com/KhronosGroup/glTF-Sample-Assets.git \
+#       assets/glTF-Sample-Assets
+# 这样仓库里只存一个 commit 指针，clone 时可按需 --recurse-submodules。
+assets/glTF-Sample-Assets/

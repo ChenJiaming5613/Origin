@@ -208,6 +208,11 @@ private:
 
     bool imguiReady_ = false;
 
+    // 屏幕密度缩放系数（桌面 1.0，手机常见 2.5~3.5）。
+    // initImGui 里从 SDL_GetWindowDisplayScale() 取得，buildUi 里手写的
+    // 绝对像素值都要乘它。
+    float uiDpiScale_ = 1.0f;
+
     // 截图：目标缓冲跟 swapchain 尺寸绑定，重建 swapchain 时一起销毁
     std::string    screenshotPath_;
     bool           screenshotPending_ = false;

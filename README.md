@@ -132,6 +132,116 @@ SDL 要求的 instance 扩展: VK_KHR_android_surface
 Vulkan 初始化完成: 1080x2400, 3 张 swapchain image
 ```
 
+### 转屏（preTransform 与 imageExtent 必须成套）
+
+Manifest 里**没有** `android:screenOrientation` —— 写了也不生效。
+SDL 在 `SDL_CreateWindow` 时会调 `Android_JNI_SetOrientation()` →
+`setRequestedOrientation()`，在运行时覆盖 Manifest：窗口带
+`SDL_WINDOW_RESIZABLE` 且未设 `SDL_HINT_ORIENTATIONS` 时，SDL 请求的是
+`SCREEN_ORIENTATION_FULL_USER`（允许所有方向，同时尊重系统的旋转锁定开关）。
+要真正锁方向得在 C++ 侧设 hint：`SDL_SetHint(SDL_HINT_ORIENTATIONS, "Portrait")`。
+
+`caps.currentTransform` 是「把 app surface 的内容映射到屏幕物理朝向」所需的旋转。
+竖屏 app 跑在竖屏手机上是 `IDENTITY`，转成横屏后变成 `ROTATE_90` / `ROTATE_270`。
+**只有两种合法组合，不能混搭：**
+
+| | `preTransform` | `imageExtent` | 额外工作 | 代价 |
+|---|---|---|---|---|
+| **A（当前）** | `IDENTITY` | `currentExtent` | 无 | 合成器一次全屏旋转 pass |
+| **B** | `currentTransform` | 设备 identity 分辨率（90/270 时宽高对调） | MVP 左乘 clip space 旋转 | 无 |
+
+⚠️ **错误组合 `preTransform = currentTransform` + `imageExtent = currentExtent`
+会让呈现引擎按旋转后的尺寸去解释一张未旋转的图像 —— 表现是转屏后画面被拉伸。**
+这是本工程早期版本的真实 bug，也是网上不少教程的默认写法（因为竖屏跑竖屏时
+`currentTransform` 恰好是 `IDENTITY`，问题被掩盖了）。
+
+B 是官方 [pre-rotation 文档](https://developer.android.com/games/optimize/vulkan-prerotation)
+推荐的性能最优解（避免 SurfaceFlinger 抢占 GPU）。**当前选 A 不是因为 A 更好，
+而是 B 会把 ImGui 一起转歪**：`imgui_impl_vulkan` 在内部自建正交矩阵、
+自己调 `vkCmdSetViewport`，拿不到我们的 pre-rotation 矩阵。
+
+B 的补偿代码已经写在 `recordCommandBuffer()` 里（`rotateDeg` / `fbWidth`
+那一段），走 A 时 `rotateDeg` 恒为 0、整段跳过，零开销。
+将来不需要调试面板时，把 `createSwapchain()` 里选 transform 的那个 `if` 改掉即可。
+注意切 B 时**两件事都要做**，漏一个就错：
+
+1. 可见宽高比要用**对调后**的值（否则横屏时 cube 被压扁）；
+2. clip space 里补一次 Z 轴旋转（否则画面躺倒）。
+
+### ImGui 的 DPI 自适应
+
+不缩放的话面板在手机上只有指甲盖大小 —— ImGui 默认尺寸是按约 96 DPI 桌面屏定的，
+手机 density 通常 2.5x~3.5x。缩放系数取自 **`SDL_GetWindowDisplayScale()`**，
+而不是 Android 的 `AConfiguration_getDensity()`：SDL 已经把 Java 侧的
+`DisplayMetrics.density` 填进了 `display->content_scale`
+（`SDL_androidvideo.c`），所以这段代码 Windows / Android 共用一份，
+不需要平台分支，也不用 include `<android/configuration.h>`。
+
+```cpp
+float dpiScale = SDL_GetWindowDisplayScale(window_);
+if (!(dpiScale > 0.0f)) dpiScale = 1.0f;
+
+ImGuiStyle& style = ImGui::GetStyle();
+style.ScaleAllSizes(dpiScale);   // padding / 圆角 / 滚动条宽度…（累积，只能调一次）
+style.FontScaleDpi = dpiScale;   // 1.92 起 io.FontGlobalScale 已废弃
+style.TouchExtraPadding = ImVec2(4.0f * dpiScale, 4.0f * dpiScale);
+```
+
+三点要注意：
+
+- `ScaleAllSizes()` 是**累积**的，对同一个 style 调两次就放大两倍 ——
+  只能在 `initImGui()` 里调一次，不能进每帧逻辑。
+- 它只管 style 里的几何量，**管不到代码里手写的绝对像素**。
+  `SetNextWindowPos/Size` 这类调用要自己乘 `uiDpiScale_`。
+- 不需要额外打包 TTF。ImGui 的默认字体 ProggyClean 是以 TTF 形式内嵌的，
+  1.92 的动态字体系统会按实际像素大小重新光栅化，放大后是清晰的。
+  （参考的 Vulkan-glTF-PBR 用 `screenDensity / ACONFIGURATION_DENSITY_MEDIUM`
+  算同一个系数，但它跑在旧 ImGui 上，必须自带 `Roboto-Medium.ttf`。）
+
+面板上另有 `Font scale` 滑条，绑定 `style.FontScaleMain`（叠加在 DPI 系数之上的
+用户偏好），可在设备上直接微调，改完立即生效、无需重建字体图集。
+
+### 16 KB 页面对齐
+
+Android 15 起有设备使用 16 KB 内存页。自 **2025-11-01** 起，提交到 Google Play
+且 `targetSdk >= 35` 的应用必须支持。本工程 `targetSdk 36`，所以是硬性要求。
+
+这件事有**两层**，容易混为一谈：
+
+| 层 | 检查方式 | 谁负责 |
+|---|---|---|
+| APK 内 `.so` 的 **zip 条目**对齐 | `zipalign -c -P 16 -v 4 app.apk` | AGP ≥ 8.5.1 自动处理 |
+| `.so` 自身的 **ELF LOAD 段**对齐 | `llvm-readelf --program-headers x.so \| grep LOAD` | 链接器标志，需手动加 |
+
+Android Studio 报 *"Some libraries have LOAD segments not aligned at 16 KB boundaries"*
+指的是**第二层**。NDK **r28 及以上默认已对齐**，r27 及以下默认 4096，必须显式加：
+
+```cmake
+add_link_options(
+    "-Wl,-z,max-page-size=16384"
+    "-Wl,-z,common-page-size=16384"
+)
+```
+
+本工程在 `CMakeLists.txt` 顶部的 `if(ANDROID)` 块里加了它。两个细节很关键：
+
+- **用 `add_link_options()` 而不是官方文档示例里的 `target_link_options()`。**
+  需要对齐的不只是 `libmain.so`，还有 `third_party/SDL` 经 `add_subdirectory`
+  产出的 `libSDL3.so`。`target_link_options` 只作用于单个 target，
+  用它会漏掉所有 submodule 里的共享库 —— 而警告恰恰会把它们逐个列出来。
+- **必须放在任何 `add_subdirectory()` 之前。** `add_link_options` 是目录作用域，
+  只被其后添加的子目录继承；放在 `add_subdirectory(SDL)` 之后就不生效。
+
+自查（`Align` 列应为 `0x4000`）：
+
+```bash
+llvm-readelf --program-headers \
+  android/app/build/intermediates/merged_native_libs/debug/mergeDebugNativeLibs/out/lib/arm64-v8a/libSDL3.so \
+  | grep LOAD
+```
+
+> 注：这个标志在 NDK r28+ 上是冗余但无害的，所以升级 NDK 后不需要回头删。
+
 ---
 
 ## 命名约定

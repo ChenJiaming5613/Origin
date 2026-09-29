@@ -36,7 +36,17 @@
 
              SDLActivity.getLibraries() 默认返回 {"SDL3", "main"}，
              这就是 CMake 目标必须命名为 main（产出 libmain.so）的原因。
-             若要改库名或加自定义逻辑，需自建一个继承 SDLActivity 的 Java 类并重写该方法。 -->
+             若要改库名或加自定义逻辑，需自建一个继承 SDLActivity 的 Java 类并重写该方法。
+
+             刻意**不写** android:screenOrientation —— 写了也没用。
+             SDL 在 SDL_CreateWindow 时会调 Android_JNI_SetOrientation()，
+             进而执行 setRequestedOrientation()，在运行时覆盖 Manifest 的取值：
+             窗口带 SDL_WINDOW_RESIZABLE 且未设 SDL_HINT_ORIENTATIONS 时，
+             SDL 请求的是 SCREEN_ORIENTATION_FULL_USER（允许所有方向，
+             同时尊重用户的「屏幕旋转锁定」系统开关）。
+             见 SDLActivity.java 的 setOrientationBis()。
+             要真正锁方向应在 C++ 侧设 hint，例如：
+               SDL_SetHint(SDL_HINT_ORIENTATIONS, "Portrait"); -->
         <activity
             android:name="org.libsdl.app.SDLActivity"
             android:label="@string/app_name"
@@ -44,7 +54,6 @@
             android:launchMode="singleInstance"
             android:configChanges="layoutDirection|locale|grammaticalGender|fontScale|fontWeightAdjustment|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
             android:preferMinimalPostProcessing="true"
-            android:screenOrientation="portrait"
             android:exported="true">
 
             <intent-filter>
