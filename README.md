@@ -35,6 +35,9 @@ Origin/
 │   ├── models/             DamagedHelmet.glb（启动时加载）
 │   └── textures/           texture.jpg（模型无贴图时的退路）
 ├── sample-assets/          大体积参考素材，**不打包、不入库**
+├── scripts/
+│   ├── build_apk.ps1       一键出 APK（自动定位 JDK/SDK/dxc）
+│   └── build_apk.cmd       可双击的包装器
 ├── third_party/            git submodule
 │   ├── SDL/                release-3.4.16
 │   ├── volk/               1.4.350
@@ -104,13 +107,47 @@ build/windows/bin/Debug/Origin.exe
 
 ## Android
 
-用 Android Studio 打开 **`Origin/android`**（注意不是仓库根），同步后 Run。
+### 一键构建（推荐，不必打开 Android Studio）
+
+```powershell
+.\scripts\build_apk.ps1                            # 出 debug APK
+.\scripts\build_apk.ps1 -Run -Logcat               # 出包 + 装机 + 启动 + 跟日志
+.\scripts\build_apk.ps1 -Config Release -Verify    # release（自动补签）+ 对齐校验
+.\scripts\build_apk.ps1 -Clean                     # 先 clean（native 全量重编，较慢）
+```
+
+也可以直接双击 `scripts\build_apk.cmd`（等价于不带参数运行）。
+
+脚本会把 Android Studio 在背后做的事显式化：定位 JDK（优先 Android Studio
+自带的 JBR）、定位 SDK 并在缺失时生成 `local.properties`、检查 9 个 submodule
+是否就位、检查 dxc 是否存在，然后调 `gradlew` 出包。
+`JAVA_HOME` / `ANDROID_HOME` / `VULKAN_SDK` **都不需要预先设置**。
+
+常用开关：
+
+| 开关 | 作用 |
+|---|---|
+| `-Install` | 构建后 `adb install -r` |
+| `-Run` | 安装并启动（隐含 `-Install`） |
+| `-Logcat` | 启动后跟随日志（隐含 `-Run`） |
+| `-Verify` | 校验 zip 层与 ELF 层的 16 KB 对齐 |
+| `-LogFile <path>` | 完整输出另存一份（含 gradle 原始输出） |
+| `-GradleArgs --info` | 透传参数给 gradlew |
+
+### 用 Android Studio
+
+打开 **`Origin/android`**（注意不是仓库根），同步后 Run。
+
+### 手动 gradle
 
 ```bash
 cd android
 gradlew.bat assembleDebug
 gradlew.bat installDebug
 ```
+
+⚠️ 手动跑 `gradlew` 需要自己设 `JAVA_HOME`，例如：
+`$env:JAVA_HOME = 'C:\Program Files\Android\Android Studio\jbr'`
 
 | 组件 | 版本 |
 |---|---|
@@ -120,6 +157,10 @@ gradlew.bat installDebug
 | compileSdk / minSdk | 36 / 24 |
 
 只编 `arm64-v8a`。改用 SDL 源码编译后每个 ABI 都要完整编一遍 SDL3，首次构建较慢。
+
+⚠️ **APK 产物在 `android/app/build/outputs/apk/<variant>/`**。
+不要去看 `build/intermediates/apk/` —— 那里的同名文件是历史构建残留，
+AGP 不保证覆盖，会拿到过期的包（曾被一个 1.1 GB 的旧包误导过）。
 
 看日志：
 
