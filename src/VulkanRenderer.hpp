@@ -1,6 +1,9 @@
 #pragma once
 
+#include "Camera.hpp"
+#include "GltfModel.hpp"
 #include "ShaderReflect.hpp"
+#include "Vertex.hpp"
 
 #include <volk.h>
 
@@ -19,15 +22,7 @@
 
 namespace origin {
 
-// 顶点格式。顶点输入描述是**手写**的，没有走反射：
-// SPIRV-Reflect 能反射出 input variable 的 location 和类型，但推不出
-// 我们想怎么打包（interleaved 还是分流、是否压缩法线），
-// 所以顶点布局留在 C++ 侧显式声明，descriptor 布局才交给反射。
-struct Vertex {
-    float position[3];
-    float normal[3];
-    float uv[2];
-};
+class CameraController;
 
 // 必须和 shaders/cube.vs.hlsl 里的 PushConstants 严格一致。
 // 这个一致性由 ShaderReflect 的 checkPushConstantSize 在启动期校验 ——
@@ -81,6 +76,16 @@ public:
 
     LightingParams&       lighting() { return lighting_; }
     const LightingParams& lighting() const { return lighting_; }
+
+    // 暴露给 CameraController 操作。渲染器只负责每帧把 aspect 喂给它、
+    // 并取 viewProj 算 MVP，不参与输入处理。
+    Camera&       camera() { return camera_; }
+    const Camera& camera() const { return camera_; }
+
+    // 可选注入：只为了让 ImGui 面板能调灵敏度和复位。
+    // 渲染器**不**通过它处理输入 —— 事件分流仍在 main.cpp 里，
+    // 这里只是个面板用的弱引用（不持有所有权）。
+    void setCameraController(CameraController* c) { cameraController_ = c; }
 
 private:
     void createInstance();
@@ -170,6 +175,8 @@ private:
     VkBuffer       indexBuffer_        = VK_NULL_HANDLE;
     VkDeviceMemory indexBufferMemory_  = VK_NULL_HANDLE;
     uint32_t       indexCount_         = 0;
+    // glTF 导入统一用 uint32；只有退回内置 cube 时才是 uint16
+    VkIndexType    indexType_          = VK_INDEX_TYPE_UINT16;
 
     VkImage        textureImage_  = VK_NULL_HANDLE;
     VkDeviceMemory textureMemory_ = VK_NULL_HANDLE;
@@ -207,6 +214,16 @@ private:
     LightingParams lighting_{};
 
     bool imguiReady_ = false;
+
+    Camera            camera_;
+    CameraController* cameraController_ = nullptr;  // 不持有
+
+    // 启动时加载的 glTF 模型。加载失败会退回内置 cube（valid() == false），
+    // 这样链路依然可见，而不是黑屏。
+    GltfModel model_;
+    // 模型包围盒中心。自转前先把它搬到原点，否则不以原点为中心的模型
+    // （很多 glTF 资产如此）会绕原点公转而不是自转。
+    glm::vec3 modelCenter_{0.0f};
 
     // 屏幕密度缩放系数（桌面 1.0，手机常见 2.5~3.5）。
     // initImGui 里从 SDL_GetWindowDisplayScale() 取得，buildUi 里手写的

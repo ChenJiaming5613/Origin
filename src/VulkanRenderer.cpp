@@ -1,5 +1,6 @@
 #include "VulkanRenderer.hpp"
 
+#include "CameraController.hpp"
 #include "ImageWrite.hpp"
 #include "Log.hpp"
 
@@ -25,6 +26,12 @@ namespace origin {
 namespace {
 
 constexpr const char* kValidationLayerName = "VK_LAYER_KHRONOS_validation";
+
+// 启动时加载的模型。路径相对资源根（桌面是 assets/，Android 是 APK 的 assets/）。
+// 换模型只改这一行即可；.gltf 和 .glb 都能喂（tg3_parse_auto 自动识别），
+// 但因为没开 tinygltf 的 FS 回调，只支持**自包含**的文件 ——
+// 引用外部 .bin / 外部贴图的 .gltf 读不到那些附属文件。
+constexpr const char* kModelAssetPath = "models/DamagedHelmet.glb";
 
 // Cube 几何：24 个顶点而不是 8 个。
 // 因为每个面需要独立的法线和 UV，共享顶点会让法线在棱边被插值成圆角、
@@ -987,12 +994,14 @@ void VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageInde
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
     // ---- 旋转与 MVP（glm，列主序，不需要转置）-------------------------------
-    const glm::mat4 model =
+    // 自转只绕 Y 轴。内置 cube 时代是绕两个轴转（为了看清六个面），
+    // 但对一个有明确"正面"的模型来说双轴自转会让人看不清朝向。
+    //
+    // 右乘 translate(-center)：把模型包围盒中心搬到原点再旋转，
+    // 否则偏离原点的模型（很多 glTF 资产并不以原点为中心）会绕着原点公转。
+    const glm::mat4 spin =
         glm::rotate(glm::mat4(1.0f), rotationRad_, glm::vec3(0.0f, 1.0f, 0.0f)) *
-        glm::rotate(glm::mat4(1.0f), rotationRad_ * 0.6f, glm::vec3(1.0f, 0.0f, 0.0f));
-
-    const glm::mat4 view =
-        glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, -3.0f));
+        glm::translate(glm::mat4(1.0f), -modelCenter_);
 
     // 转屏补偿。走默认的 IDENTITY 路径时 rotateDeg 恒为 0、下面的旋转整段跳过，
     // 所以这段对桌面端和默认 Android 路径都是零开销；只有 createSwapchain
@@ -1020,23 +1029,22 @@ void VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageInde
         default:
             break;
     }
-    const float aspect = fbWidth / fbHeight;
+    // 注意喂给相机的是**可见区域**的宽高比（已按 transform 对调），
+    // 不是 framebuffer 的宽高比 —— 两者在 pre-rotation 路径下并不相同。
+    camera_.setAspect(fbWidth / fbHeight);
 
-    // GLM_FORCE_DEPTH_ZERO_TO_ONE 已由 CMake 传入，所以这里产出的是 Vulkan
-    // 需要的 [0,1] 深度。但 glm 不管 Y 方向，还要手动翻一下 ——
-    // Vulkan 的 NDC 里 Y 朝下，不翻的话画面上下颠倒。
-    glm::mat4 proj = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 100.0f);
-    proj[1][1] *= -1.0f;
-
+    // 投影的 Y 翻转与 [0,1] 深度都在 Camera::proj() 里处理。
+    // 但 pre-rotation 的那次旋转刻意留在渲染器：它属于呈现层的事，
+    // 和「相机怎么看世界」无关，放进 Camera 会让相机类耦合 Android 的呈现细节。
+    glm::mat4 viewProj = camera_.viewProj();
     if (rotateDeg != 0.0f) {
         // 左乘：等价于官方文档写的 MVP = pre_rotate * MVP
-        proj = glm::rotate(glm::mat4(1.0f), glm::radians(rotateDeg),
-                           glm::vec3(0.0f, 0.0f, 1.0f)) *
-               proj;
+        viewProj = glm::rotate(glm::mat4(1.0f), glm::radians(rotateDeg),
+                               glm::vec3(0.0f, 0.0f, 1.0f)) *
+                   viewProj;
     }
 
     CubePushConstants pc{};
-    pc.mvp = proj * view * model;
 
     // 方位角/仰角 -> 世界空间方向
     const float az = glm::radians(lighting_.azimuthDeg);
@@ -1044,27 +1052,54 @@ void VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageInde
     const glm::vec3 lightWorld{std::cos(el) * std::sin(az), std::sin(el),
                                std::cos(el) * std::cos(az)};
 
-    // 把光源方向变换到物体空间，这样 shader 里可以直接和物体空间法线点乘，
-    // 省掉在 push constant 里再带一个法线矩阵。
-    // model 只含旋转，所以逆 == 转置，不需要求逆。
-    const glm::vec3 lightObj = glm::transpose(glm::mat3(model)) * lightWorld;
+    pc.lightColor = glm::vec4(lighting_.color[0], lighting_.color[1], lighting_.color[2],
+                              lighting_.intensity);
 
-    pc.lightDirObj = glm::vec4(lightObj, lighting_.ambient);
-    pc.lightColor  = glm::vec4(lighting_.color[0], lighting_.color[1],
-                               lighting_.color[2], lighting_.intensity);
+    // stageFlags 与 size 都取自反射结果，没有手写常量。
+    // 下面按 primitive 逐个覆盖 pc.mvp 后重新 push —— push constant 的
+    // 写入是记录进 command buffer 的，每次 push 只影响其后的 draw。
+    auto pushAndDraw = [&](const glm::mat4& nodeTransform, uint32_t firstIndex,
+                           uint32_t count, uint32_t vertexOffset) {
+        const glm::mat4 world = spin * nodeTransform;
+        pc.mvp               = viewProj * world;
 
-    // stageFlags 与 size 都取自反射结果，没有手写常量
-    vkCmdPushConstants(cmd, program_.layout, program_.pushConstantStages, 0,
-                       program_.pushConstantSize, &pc);
+        // 光源方向变换到该 primitive 的物体空间，于是 shader 里可以直接和
+        // 物体空间法线点乘，push constant 里不必再带一条法线矩阵。
+        //
+        // 这里用 inverse 而不是 transpose：cube 时代 model 只含旋转，
+        // 逆等于转置；但 glTF 的节点普遍带缩放，那时转置就不是逆了，
+        // 光照方向会随缩放而偏。
+        //
+        // 已知不足：非等比缩放下法线本身也会被 shader 里的 normalize 扭曲，
+        // 严格做法是在世界空间打光并传 inverse-transpose 法线矩阵。
+        // 对当前的单模型展示够用，等做 PBR 时一并改。
+        const glm::vec3 lightObj = glm::inverse(glm::mat3(world)) * lightWorld;
+        pc.lightDirObj = glm::vec4(lightObj, lighting_.ambient);
+
+        vkCmdPushConstants(cmd, program_.layout, program_.pushConstantStages, 0,
+                           program_.pushConstantSize, &pc);
+        vkCmdDrawIndexed(cmd, count, 1, firstIndex, static_cast<int32_t>(vertexOffset), 0);
+    };
 
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, program_.layout, 0, 1,
                             &descriptorSet_, 0, nullptr);
 
     const VkDeviceSize vertexOffset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer_, &vertexOffset);
-    vkCmdBindIndexBuffer(cmd, indexBuffer_, 0, VK_INDEX_TYPE_UINT16);
+    // glTF 导入统一转成 uint32（模型顶点数常常超过 65535），
+    // 内置 cube 的索引数组仍是 uint16 —— 类型在 createCubeMesh 里定好。
+    vkCmdBindIndexBuffer(cmd, indexBuffer_, 0, indexType_);
 
-    vkCmdDrawIndexed(cmd, indexCount_, 1, 0, 0, 0);
+    if (model_.valid()) {
+        // 每个 primitive 带自己由节点层级累乘出的变换。
+        // 这里没有做材质切换 —— 当前只有一条 pipeline、一张 baseColor 贴图，
+        // 多材质需要按材质分组并重绑 descriptor，属于下一步的事。
+        for (const auto& prim : model_.primitives()) {
+            pushAndDraw(prim.transform, prim.firstIndex, prim.indexCount, prim.vertexOffset);
+        }
+    } else {
+        pushAndDraw(glm::mat4(1.0f), 0, indexCount_, 0);
+    }
 
     // ImGui 必须画在同一个 render pass 内、且在 cube 之后（它不写深度，
     // 要靠绘制顺序盖在场景上面）。
@@ -1456,10 +1491,36 @@ void VulkanRenderer::buildUi() {
         // 设备上再微调字号。FontScaleDpi 已经按屏幕密度自动设好，这一项是
         // 叠加在它之上的用户偏好（style.FontScaleMain），改完立即生效 ——
         // 1.92 的字体是动态光栅化的，不需要重建字体图集。
+        ImGui::SeparatorText("Camera");
+        ImGui::Text("distance %.2f  (drag=orbit, wheel/pinch=zoom)", camera_.distance());
+        if (cameraController_ != nullptr) {
+            ImGui::SliderFloat("Orbit speed", &cameraController_->rotateSpeed, 0.2f, 3.0f,
+                               "%.2f");
+            ImGui::SliderFloat("Zoom speed", &cameraController_->zoomSpeed, 0.2f, 3.0f,
+                               "%.2f");
+            ImGui::Checkbox("Invert Y", &cameraController_->invertY);
+        }
+        if (ImGui::Button("Reset view")) {
+            camera_.reset();
+            if (model_.valid()) {
+                const float radius = std::max(model_.boundsRadius(), 0.001f);
+                camera_.setDistance(radius / std::tan(glm::radians(30.0f)) * 1.6f);
+            }
+        }
+
         ImGui::SeparatorText("UI");
         ImGui::SliderFloat("Font scale", &ImGui::GetStyle().FontScaleMain, 0.5f, 3.0f,
                            "%.2fx");
         ImGui::Text("auto DPI scale: %.2fx", uiDpiScale_);
+
+        ImGui::SeparatorText("Model");
+        if (model_.valid()) {
+            ImGui::Text("%zu primitives, %zu verts", model_.primitives().size(),
+                        model_.vertices().size());
+            ImGui::Text("bounds radius %.3f", model_.boundsRadius());
+        } else {
+            ImGui::TextUnformatted("builtin cube (glTF load failed)");
+        }
 
         ImGui::SeparatorText("Reflected layout");
         ImGui::Text("push constant: %u bytes", program_.pushConstantSize);
@@ -1643,14 +1704,52 @@ void VulkanRenderer::createDepthResources() {
 // =============================================================================
 
 void VulkanRenderer::createCubeMesh() {
-    uploadViaStaging(kCubeVertices, sizeof(kCubeVertices),
-                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertexBuffer_, vertexBufferMemory_);
-    uploadViaStaging(kCubeIndices, sizeof(kCubeIndices),
-                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indexBuffer_, indexBufferMemory_);
+    // 优先加载 glTF 模型；失败则退回内置 cube。
+    //
+    // 这个退路不是摆设：模型文件可能没被打进 APK、或者用户换了个
+    // 带不支持特性的文件。有退路的话链路依然可见（画面出 cube），
+    // 而不是黑屏让人无从判断是资源问题还是渲染问题。
+    const void*  vtxData  = kCubeVertices;
+    VkDeviceSize vtxBytes = sizeof(kCubeVertices);
+    const void*  idxData  = kCubeIndices;
+    VkDeviceSize idxBytes = sizeof(kCubeIndices);
+    uint32_t     idxCount = static_cast<uint32_t>(sizeof(kCubeIndices) / sizeof(kCubeIndices[0]));
 
-    indexCount_ = static_cast<uint32_t>(sizeof(kCubeIndices) / sizeof(kCubeIndices[0]));
-    spdlog::info("cube 网格: {} 顶点, {} 索引",
-                 sizeof(kCubeVertices) / sizeof(kCubeVertices[0]), indexCount_);
+    try {
+        std::vector<uint8_t> bytes = readAsset(kModelAssetPath);
+        model_.loadFromMemory(bytes.data(), bytes.size(), kModelAssetPath);
+    } catch (const std::exception& e) {
+        spdlog::warn("glTF 模型加载失败，退回内置 cube: {}", e.what());
+    }
+
+    if (model_.valid()) {
+        vtxData  = model_.vertices().data();
+        vtxBytes = model_.vertices().size() * sizeof(Vertex);
+        idxData  = model_.indices().data();
+        idxBytes = model_.indices().size() * sizeof(uint32_t);
+        idxCount = static_cast<uint32_t>(model_.indices().size());
+
+        // 让相机自动取一个能把模型完整收进画面的距离。
+        // 不这么做的话，DamagedHelmet（半径约 1）和 Sponza（半径几十）
+        // 用同一个固定距离会一个偏小一个塞满屏幕。
+        // /tan(fov/2) 是让包围球正好内切于竖直视野，再留 1.6 倍余量。
+        const float radius = std::max(model_.boundsRadius(), 0.001f);
+        camera_.setDistanceLimits(radius * 0.1f, radius * 50.0f);
+        camera_.setDistance(radius / std::tan(glm::radians(30.0f)) * 1.6f);
+        modelCenter_ = model_.boundsCenter();
+    }
+
+    uploadViaStaging(vtxData, vtxBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertexBuffer_,
+                     vertexBufferMemory_);
+    uploadViaStaging(idxData, idxBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indexBuffer_,
+                     indexBufferMemory_);
+    indexCount_ = idxCount;
+    indexType_  = model_.valid() ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+
+    if (!model_.valid()) {
+        spdlog::info("内置 cube 网格: {} 顶点, {} 索引",
+                     sizeof(kCubeVertices) / sizeof(kCubeVertices[0]), indexCount_);
+    }
 }
 
 void VulkanRenderer::createTexture() {
@@ -1658,19 +1757,39 @@ void VulkanRenderer::createTexture() {
     // 用 stbi_load_from_memory 而不是 stbi_load：后者要 fopen，
     // 而 APK 内的 asset 没有文件系统路径 —— 这也是 StbImage.cpp 里
     // 定义 STBI_NO_STDIO 的原因。
-    std::vector<uint8_t> fileBytes = readAsset("textures/texture.jpg");
+    // 优先用 glTF 内嵌的基础色贴图；模型没有贴图时才退回工程自带的 texture.jpg。
+    //
+    // 注意这里体现了 GltfModel 的设计取舍：它刻意**不**解码图像
+    // （tinygltf 的 images_as_is=1），只把原始 PNG/JPEG 字节交出来，
+    // 于是解码统一走工程里唯一的那份 stb 实现（src/StbImage.cpp），
+    // 不会出现第二个 STB_IMAGE_IMPLEMENTATION。
+    std::vector<uint8_t> fileBytes;
+    const uint8_t*       encoded     = nullptr;
+    size_t               encodedSize = 0;
+    const char*          texSource   = nullptr;
+
+    if (model_.baseColorImage().data != nullptr) {
+        encoded     = model_.baseColorImage().data;
+        encodedSize = model_.baseColorImage().size;
+        texSource   = "glTF baseColorTexture";
+    } else {
+        fileBytes   = readAsset("textures/texture.jpg");
+        encoded     = fileBytes.data();
+        encodedSize = fileBytes.size();
+        texSource   = "textures/texture.jpg";
+    }
 
     int width = 0, height = 0, channels = 0;
     // 强制解成 4 通道：RGB 三通道纹理在很多 GPU 上不被支持为采样格式，
     // 而 R8G8B8A8 是 Vulkan 保证支持的。
-    stbi_uc* pixels = stbi_load_from_memory(fileBytes.data(),
-                                            static_cast<int>(fileBytes.size()), &width,
+    stbi_uc* pixels = stbi_load_from_memory(encoded, static_cast<int>(encodedSize), &width,
                                             &height, &channels, STBI_rgb_alpha);
     if (pixels == nullptr) {
-        throw std::runtime_error(std::string("解码 texture.jpg 失败: ") +
+        throw std::runtime_error(std::string("解码纹理失败 (") + texSource + "): " +
                                  stbi_failure_reason());
     }
-    spdlog::info("纹理: {}x{}, 源通道数 {} (已强制转为 RGBA)", width, height, channels);
+    spdlog::info("纹理[{}]: {}x{}, 源通道数 {} (已强制转为 RGBA)", texSource, width, height,
+                 channels);
 
     const VkDeviceSize imageSize = static_cast<VkDeviceSize>(width) * height * 4;
 

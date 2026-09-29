@@ -58,7 +58,8 @@ foreach(_dep
         "SPIRV-Reflect/spirv_reflect.c"
         "stb/stb_image.h"
         "glm/glm/glm.hpp"
-        "imgui/imgui.cpp")
+        "imgui/imgui.cpp"
+        "tinygltf/tiny_gltf_v3.c")
     if(NOT EXISTS "${ORIGIN_THIRD_PARTY}/${_dep}")
         message(FATAL_ERROR
             "缺少 submodule 文件: third_party/${_dep}\n"
@@ -134,6 +135,35 @@ endif()
 # Debug 下打开它自己的断言：拿到畸形 SPIR-V 时当场停住，而不是返回错误码后继续跑
 target_compile_definitions(spirv_reflect PRIVATE
     $<$<CONFIG:Debug>:SPIRV_REFLECT_ENABLE_ASSERTS>)
+
+# ---- tinygltf ----------------------------------------------------------------
+# v3 是纯 C 的重写版（tiny_gltf_v3.{c,h} + tinygltf_json_c.h），
+# 不再是 v2 那个 header-only 的 C++ 版本。选它而不是 v2.9.x 有两个实在的理由：
+#
+#   1. 文件 IO 与图像解码都是 **opt-in**（默认关闭）。
+#      v2 默认自带 stb_image 实现，和本工程 src/StbImage.cpp 里的
+#      STB_IMAGE_IMPLEMENTATION 会撞成重复符号，必须靠一串
+#      TINYGLTF_NO_INCLUDE_STB_IMAGE 之类的宏小心绕开；
+#      v3 压根不碰 stb，图像原始字节交给我们自己解码，冲突不存在。
+#   2. v2 要在 Android 上读 APK 内的资源必须替换它的 FsCallbacks；
+#      v3 只提供 tg3_parse_glb(内存指针)，我们用 SDL_LoadFile 读进内存直接喂给它，
+#      平台差异自然消失。
+#
+# 同样不用 add_subdirectory —— 上游 CMakeLists 的
+# TINYGLTF3_BUILD_TESTS / TINYGLTF3_INSTALL 默认都是 ON，
+# 且有目录作用域的 set(CMAKE_C_STANDARD 11) 会向下泄漏。
+set(ORIGIN_TINYGLTF_DIR "${ORIGIN_THIRD_PARTY}/tinygltf")
+add_library(tinygltf STATIC "${ORIGIN_TINYGLTF_DIR}/tiny_gltf_v3.c")
+target_include_directories(tinygltf PUBLIC "${ORIGIN_TINYGLTF_DIR}")
+# 上游明确要求以 C11 或更高标准编译这个 .c
+set_target_properties(tinygltf PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+if(MSVC)
+    target_compile_definitions(tinygltf PRIVATE _CRT_SECURE_NO_WARNINGS)
+    # /utf-8：源码里有非 ASCII 字符（注释中的示例文本），
+    # 在中文 Windows 上 MSVC 默认按 GBK(936) 解读，会刷一堆 C4819。
+    # 主 target 已经带了这个开关，第三方 target 得各自加。
+    target_compile_options(tinygltf PRIVATE /utf-8)
+endif()
 
 # ---- stb ---------------------------------------------------------------------
 # 单头库，只用到 stb_image.h 做 jpg/png 解码。
@@ -283,6 +313,9 @@ set(ORIGIN_SOURCES
     src/VulkanRenderer.cpp
     src/ShaderReflect.cpp
     src/StbImage.cpp
+    src/Camera.cpp
+    src/CameraController.cpp
+    src/GltfModel.cpp
 )
 
 if(ANDROID)
@@ -307,6 +340,7 @@ target_link_libraries(${ORIGIN_TARGET} PRIVATE
     spdlog::spdlog
     spirv_reflect
     stb
+    tinygltf
     glm
     imgui
 )
@@ -316,7 +350,7 @@ target_link_libraries(${ORIGIN_TARGET} PRIVATE
 #
 # 用 INTERFACE_SYSTEM_INCLUDE_DIRECTORIES 而不是 add_subdirectory(... SYSTEM)：
 # 后者需要 CMake 3.25+，而 Android 侧用的是 SDK 自带的 3.22.1。
-foreach(_tp_target spdlog volk SDL3-static SDL3-shared spirv_reflect glm imgui stb)
+foreach(_tp_target spdlog volk SDL3-static SDL3-shared spirv_reflect glm imgui stb tinygltf)
     if(TARGET ${_tp_target})
         get_target_property(_tp_inc ${_tp_target} INTERFACE_INCLUDE_DIRECTORIES)
         if(_tp_inc)

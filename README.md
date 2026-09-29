@@ -23,12 +23,18 @@ Origin/
 │   ├── main.cpp            SDL main callbacks + spdlog→SDL_Log 的 sink
 │   ├── VulkanRenderer.*    渲染逻辑 + ImGui 生命周期与面板
 │   ├── ShaderReflect.*     SPIR-V 反射 -> VkDescriptorSetLayout / VkPipelineLayout
+│   ├── Camera.*            轨道相机（纯数学，无输入/无 Vulkan）
+│   ├── CameraController.*  arcball 输入：鼠标 + 多点触摸
+│   ├── GltfModel.*         glTF 导入（tinygltf v3，纯 CPU 侧）
+│   ├── Vertex.hpp          顶点格式（独立出来供导入器复用）
 │   ├── StbImage.cpp        stb_image 的唯一实现单元
 │   └── Log.hpp             VK_CHECK
 ├── shaders/                HLSL 源（cube.vs.hlsl / cube.ps.hlsl）
 ├── assets/
 │   ├── shaders/            SPIR-V（构建产物，两平台共用）
-│   └── textures/           texture.jpg
+│   ├── models/             DamagedHelmet.glb（启动时加载）
+│   └── textures/           texture.jpg（模型无贴图时的退路）
+├── sample-assets/          大体积参考素材，**不打包、不入库**
 ├── third_party/            git submodule
 │   ├── SDL/                release-3.4.16
 │   ├── volk/               1.4.350
@@ -37,6 +43,7 @@ Origin/
 │   ├── glm/                1.0.3
 │   ├── imgui/              v1.92.9b（非 docking）
 │   ├── stb/                master（只用 stb_image.h）
+│   ├── tinygltf/           v3.0.1（纯 C 版）
 │   └── spdlog/             v1.15.3
 └── android/                Android 壳（无 C++ 代码、无 Java 代码）
     ├── settings.gradle, build.gradle, gradle.properties, gradlew*
@@ -340,6 +347,114 @@ configure 必然早于任何打包任务。（build 阶段的增量重编也保�
 3. 顶点/索引缓冲 + VMA
 
 ---
+
+## 相机：Camera + CameraController
+
+两个类刻意分开，各自零依赖外扩：
+
+- **`Camera`**（`src/Camera.{hpp,cpp}`）纯数学，不含输入处理也不含任何 Vulkan 调用。
+- **`CameraController`**（`src/CameraController.{hpp,cpp}`）只把 SDL 事件翻译成 Camera 操作。
+
+状态用「目标点 + **朝向四元数** + 距离」而不是 yaw/pitch 欧拉角，理由有两条：
+arcball 的自然输出就是一个任意轴的旋转增量，四元数可直接左乘累积，
+用欧拉角必须先拆成 yaw/pitch，斜向拖动会失真；另外四元数没有万向锁，
+可以越过天顶继续转。
+
+手势映射（两端语义一致）：
+
+| Windows / 鼠标 | Android / 触摸 | 动作 |
+|---|---|---|
+| 左键拖动 | 单指拖动 | 旋转 |
+| 右/中键拖动 | 双指平移 | 平移 |
+| 滚轮 | 双指捏合 | 缩放 |
+
+### ⚠️ 触摸会额外合成一份鼠标事件
+
+SDL 默认开启 `SDL_HINT_TOUCH_MOUSE_EVENTS`，触摸除了发 `SDL_EVENT_FINGER_*`
+还会**再合成一份鼠标事件**。不滤掉的话，Android 上单指拖动会被
+「触摸路径」和「鼠标路径」各处理一次 —— 旋转速度翻倍，而且双指手势
+会和合成出的鼠标拖动打架。识别方式是 `which == SDL_TOUCH_MOUSEID`：
+
+```cpp
+if (event.motion.which == SDL_TOUCH_MOUSEID) return false;
+```
+
+另外三处容易漏的细节：
+
+- `SDL_EVENT_FINGER_CANCELED` 必须和 `FINGER_UP` 一起处理（来电、下拉通知栏会触发）。
+  漏了它手指状态会永久停在按下态，回到应用后第一次触摸就跳变。
+- 双指变单指时要把剩下那根手指的位置重设为新的旋转基准，否则松开一根手指
+  的瞬间会以另一根手指的**旧**位置为起点，产生一次突兀旋转。
+- 事件必须先给 ImGui，并在 `io.WantCaptureMouse` 为真时跳过相机 ——
+  否则拖面板上的滑条会同时把模型转起来。
+
+鼠标坐标换算用 `SDL_GetWindowSize`（逻辑坐标）而不是 `SDL_GetWindowSizeInPixels`：
+鼠标事件给的就是逻辑坐标，高 DPI 下两者不等，混用会让灵敏度偏掉。
+触摸事件的 `tfinger.x/y` 本来就是归一化的 0..1，直接线性映射即可。
+
+## glTF 导入
+
+`src/GltfModel.{hpp,cpp}`，启动时加载 `assets/models/DamagedHelmet.glb`
+（换模型只改 `VulkanRenderer.cpp` 里的 `kModelAssetPath`）。
+加载失败会**退回内置 cube** 并打日志 —— 有退路时链路依然可见，
+不会黑屏让人分不清是资源问题还是渲染问题。
+
+### 为什么用 tinygltf v3 而不是大家更熟的 v2.9.x
+
+v3 是纯 C 的重写版（`tiny_gltf_v3.{c,h}`），不再是 header-only 的 C++ 版。
+对本工程有两个实打实的好处：
+
+1. **文件 IO 与图像解码都是 opt-in（默认关闭）。**
+   v2 默认自带 stb_image 实现，会和 `src/StbImage.cpp` 里的
+   `STB_IMAGE_IMPLEMENTATION` 撞成重复符号，得靠一串
+   `TINYGLTF_NO_INCLUDE_STB_IMAGE` 之类的宏小心绕开。
+   v3 压根不碰 stb —— 我们设 `images_as_is = 1`，它只交出原始 PNG/JPEG 字节，
+   解码统一走工程里唯一那份 stb 实现。
+2. **v2 要读 APK 内的资源必须替换它的 `FsCallbacks`**；
+   v3 只提供 `tg3_parse_glb/auto(内存指针)`，我们用 `SDL_LoadFile`
+   读进内存直接喂给它，平台差异自然消失。
+
+顺带也和工程「Vulkan 用 C API、不用 Vulkan-Hpp」的取向一致。
+
+### 导入器里两处容易写错的地方
+
+**顶点属性可能是交错存放的。** 多个属性共享一个 bufferView，各自用
+`byteOffset` + `byteStride` 区分，**绝不能**假设数据紧密排列后按
+`index * elementSize` 索引。`byteStride == 0` 才表示紧密排列。
+
+**四元数分量顺序不同。** glTF 的 `node.rotation` 是 `[x, y, z, w]`，
+而 `glm::quat` 的构造函数是 `(w, x, y, z)`。照下标顺序传会得到一个
+完全错误的旋转：
+
+```cpp
+const glm::quat r(n.rotation[3], n.rotation[0], n.rotation[1], n.rotation[2]);
+```
+
+另外节点层级用**显式栈**展开而不是函数递归：层级深度由文件决定，
+异常文件可以做出几万层嵌套把调用栈爆掉。accessor 也自己做了
+`offset + stride * count` 的越界检查 —— tinygltf 的 `validate_indices`
+只校验索引字段范围，不保证 bufferView 切片落在 buffer 内。
+
+### 当前支持的子集
+
+支持：默认场景的节点层级（展平成每 primitive 一份世界变换）、
+POSITION / NORMAL / TEXCOORD_0、三角形拓扑、索引统一转 uint32、
+baseColorTexture。
+
+不支持（都会明确打日志，不静默出错画面）：动画、蒙皮、morph target、
+Draco 压缩、KTX2/basisu、多材质切换、以及除 baseColor 外的 PBR 贴图。
+因为没开 FS 回调，**只支持自包含的 `.glb`** —— 引用外部 `.bin` 或
+外部贴图的 `.gltf` 读不到附属文件。
+
+## ⚠️ assets/ 里不要放大体积素材
+
+Android 的 `sourceSets.main.assets.srcDirs` 指向整个 `assets/`，
+放进去的东西会被**原样打进 APK**。曾经把 3 GB 的
+`glTF-Sample-Assets` 放在 `assets/` 下，结果 APK 体积 **1.1 GB**、
+含 2506 个样例资产条目。
+
+所以参考素材放在 **`sample-assets/`**（与 `assets/` 平级，已 gitignore），
+只有真正要在设备上加载的文件才进 `assets/`。当前 `assets/` 只有 3.7 MB。
 
 ## HLSL + DXC 的三个坑（都已踩过并验证）
 

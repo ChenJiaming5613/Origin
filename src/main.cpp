@@ -24,6 +24,7 @@
 #include <SDL3/SDL_video.h>
 
 #include "Log.hpp"
+#include "CameraController.hpp"
 #include "VulkanRenderer.hpp"
 
 #include <spdlog/sinks/base_sink.h>
@@ -92,8 +93,11 @@ void initLogging() {
 namespace {
 
 struct AppState {
-    SDL_Window*           window = nullptr;
+    SDL_Window*            window = nullptr;
     origin::VulkanRenderer renderer;
+    // 控制器要引用渲染器持有的 Camera，而 Camera 在 renderer.init() 之后
+    // 才被设好初始距离，所以用 unique_ptr 延迟到那之后再构造。
+    std::unique_ptr<origin::CameraController> camera;
 };
 
 }  // namespace
@@ -130,6 +134,11 @@ SDL_AppResult SDL_AppInit(void** appstate, int /*argc*/, char** /*argv*/) {
         return SDL_APP_FAILURE;
     }
 
+    // 相机控制器。必须在 init() 之后构造：init 里加载完 glTF 才会按模型
+    // 包围盒设好初始距离与距离上下限，提前构造拿不到这些值。
+    state->camera = std::make_unique<origin::CameraController>(state->renderer.camera(), window);
+    state->renderer.setCameraController(state->camera.get());
+
     // 交出所有权，之后由 SDL_AppQuit 负责释放
     *appstate = state.release();
     return SDL_APP_CONTINUE;
@@ -165,10 +174,18 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
     // 先喂给 ImGui。不做这一步面板能画出来但完全点不动 ——
     // 鼠标位置、点击、滚轮、键盘全靠这里注入。
     //
-    // 这里刻意不根据 io.WantCaptureMouse 提前 return：
-    // 当前应用层没有自己的鼠标交互（没有相机控制），不存在争抢；
-    // 等加了轨道相机再按 WantCaptureMouse / WantCaptureKeyboard 分流。
     ImGui_ImplSDL3_ProcessEvent(event);
+
+    // 再交给相机，但**必须**让 ImGui 优先：
+    // 不判断 WantCaptureMouse 的话，在面板上拖滑条会同时把模型转起来。
+    //
+    // 注意 WantCaptureMouse 是 ImGui 上一帧算出来的状态，对「拖动中途
+    // 鼠标移出面板」这种情况仍然有效（ImGui 会保持捕获直到松开）。
+    if (state->camera != nullptr && !ImGui::GetIO().WantCaptureMouse) {
+        if (state->camera->handleEvent(*event)) {
+            return SDL_APP_CONTINUE;  // 已被相机消费，不再往下走
+        }
+    }
 
     switch (event->type) {
         case SDL_EVENT_QUIT:
@@ -187,6 +204,11 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
         // 所以这里只记录日志即可，不需要手动销毁 surface。
         case SDL_EVENT_WILL_ENTER_BACKGROUND:
             spdlog::info("即将进入后台");
+            // 清掉按下/触摸状态。不清的话，在拖动中切后台再回来，
+            // 控制器仍以为按键按着，下一次移动会产生一次巨大的跳变旋转。
+            if (state->camera != nullptr) {
+                state->camera->resetInputState();
+            }
             break;
         case SDL_EVENT_DID_ENTER_FOREGROUND:
             spdlog::info("已回到前台");
