@@ -27,6 +27,39 @@ namespace {
 
 constexpr const char* kValidationLayerName = "VK_LAYER_KHRONOS_validation";
 
+// 全工程唯一的 Vulkan 版本基线，instance / device / imgui 三处都引用它。
+//
+// 为什么是 1.3 而不是更低：dynamic rendering 在 1.3 才进入核心。
+// 走 VK_KHR_dynamic_rendering 扩展理论上 1.2 就够（见 vk.xml 的 depends），
+// 但在 Android 上那条路不存在 ——
+//   1. Android 平台只暴露 1.0.3 / 1.1 / 1.3 三档，**没有 1.2**，
+//      且不允许请求超过当前 Android 版本的上限（1.3 -> API 33 起）；
+//   2. 实测（设备农场跨 94 个设备/OS 组合）不暴露 1.3 的设备
+//      连 VK_KHR_dynamic_rendering 扩展都不暴露，没有「扩展兜底」这条退路。
+// 所以要么 1.3，要么维护第二条 renderpass 路径。本工程选前者，
+// 代价是 Android minSdk 抬到 33（见 android/app/build.gradle 的说明）。
+constexpr uint32_t kRequiredApiVersion = VK_API_VERSION_1_3;
+
+// 深度图在 VkImageMemoryBarrier 里需要的 aspectMask。
+//
+// 这是改用 dynamic rendering 后**新增**的一处要求：以前 layout 转换由
+// renderPass 按附件格式自动处理，现在 barrier 要自己写，而规范要求
+// （VUID-VkImageMemoryBarrier-image-03319）当格式同时含深度与 stencil、
+// 且 layout 是 DEPTH_STENCIL_ATTACHMENT_OPTIMAL 时，aspectMask 必须两位都标上。
+//
+// 注意这和 VkImageView 的 aspectMask 不同 —— 后者只标 DEPTH_BIT 是合法的
+// （我们只把它当深度附件用），两处不一致是正常的，不要"统一"成一个值。
+constexpr VkImageAspectFlags depthAspectMask(VkFormat format) {
+    switch (format) {
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_D16_UNORM_S8_UINT:
+            return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        default:
+            return VK_IMAGE_ASPECT_DEPTH_BIT;
+    }
+}
+
 // 启动时加载的模型。路径相对资源根（桌面是 assets/，Android 是 APK 的 assets/）。
 // 换模型只改这一行即可；.gltf 和 .glb 都能喂（tg3_parse_auto 自动识别），
 // 但因为没开 tinygltf 的 FS 回调，只支持**自包含**的文件 ——
@@ -174,13 +207,15 @@ void VulkanRenderer::init(SDL_Window* window) {
     // 加载 device 级函数指针，绕过 loader 的 dispatch 直接指向驱动函数
     volkLoadDevice(device_);
 
+    // 必须在任何资源创建之前：下面所有 buffer/image 都走它分配
+    createAllocator();
+
     // command pool 必须先建：顶点缓冲与纹理都要走 staging 上传，
     // 而上传需要一个临时 command buffer。
     createCommandBuffers();
 
     createSwapchain();
     createDepthResources();
-    createRenderPass();
 
     createCubeMesh();
     createTexture();
@@ -188,10 +223,11 @@ void VulkanRenderer::init(SDL_Window* window) {
     createPipeline();       // 内部调 createProgram()，layout 由反射生成
     createDescriptorSet();  // 需要 program_.setLayout 与纹理都已就位
 
-    createFramebuffers();
     createSyncObjects();
 
-    initImGui();  // 需要 renderPass 与 swapchain image 数量都已确定
+    // initImGui 需要 swapchainFormat_（填 PipelineRenderingCreateInfo）
+    // 与 swapchain image 数量都已确定
+    initImGui();
 
     lastTicks_ = SDL_GetTicks();
 
@@ -245,30 +281,23 @@ void VulkanRenderer::shutdown() {
         vkDestroyImageView(device_, textureView_, nullptr);
         textureView_ = VK_NULL_HANDLE;
     }
+    // vmaDestroyImage / vmaDestroyBuffer 同时销毁句柄与归还那段分配。
+    // 注意不能再配对 vkFreeMemory —— VmaAllocation 是某块大内存里的一段，
+    // 对它调 vkFreeMemory 会释放整块（含别人的资源）。
     if (textureImage_ != VK_NULL_HANDLE) {
-        vkDestroyImage(device_, textureImage_, nullptr);
+        vmaDestroyImage(allocator_, textureImage_, textureAlloc_);
         textureImage_ = VK_NULL_HANDLE;
+        textureAlloc_ = VK_NULL_HANDLE;
     }
-    if (textureMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, textureMemory_, nullptr);
-        textureMemory_ = VK_NULL_HANDLE;
-    }
-
     if (indexBuffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, indexBuffer_, nullptr);
+        vmaDestroyBuffer(allocator_, indexBuffer_, indexAlloc_);
         indexBuffer_ = VK_NULL_HANDLE;
-    }
-    if (indexBufferMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, indexBufferMemory_, nullptr);
-        indexBufferMemory_ = VK_NULL_HANDLE;
+        indexAlloc_  = VK_NULL_HANDLE;
     }
     if (vertexBuffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, vertexBuffer_, nullptr);
+        vmaDestroyBuffer(allocator_, vertexBuffer_, vertexAlloc_);
         vertexBuffer_ = VK_NULL_HANDLE;
-    }
-    if (vertexBufferMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, vertexBufferMemory_, nullptr);
-        vertexBufferMemory_ = VK_NULL_HANDLE;
+        vertexAlloc_  = VK_NULL_HANDLE;
     }
 
     if (pipeline_ != VK_NULL_HANDLE) {
@@ -280,10 +309,14 @@ void VulkanRenderer::shutdown() {
     destroyShaderStage(device_, vertexStage_);
     destroyShaderStage(device_, pixelStage_);
 
-    if (renderPass_ != VK_NULL_HANDLE) {
-        vkDestroyRenderPass(device_, renderPass_, nullptr);
-        renderPass_ = VK_NULL_HANDLE;
+    // allocator 必须在 device 之前销毁。
+    // 若此时还有未释放的 allocation，VMA 会在 Debug 下断言并打印泄漏清单 ——
+    // 这本身就是个有用的收尾检查，比裸 vkFreeMemory 时代什么都不报要好。
+    if (allocator_ != VK_NULL_HANDLE) {
+        vmaDestroyAllocator(allocator_);
+        allocator_ = VK_NULL_HANDLE;
     }
+
     if (device_ != VK_NULL_HANDLE) {
         vkDestroyDevice(device_, nullptr);
         device_ = VK_NULL_HANDLE;
@@ -314,11 +347,37 @@ void VulkanRenderer::shutdown() {
 // =============================================================================
 
 void VulkanRenderer::createInstance() {
+    // 先问 loader 支不支持 1.3，再去填 appInfo.apiVersion。
+    //
+    // 这一步不能省：在纯 1.0 loader 上直接把 apiVersion 填 1.3，
+    // vkCreateInstance 会返回 VK_ERROR_INCOMPATIBLE_DRIVER —— 那个错误码
+    // 读起来像「这台机器没有 Vulkan 驱动」，会把排查方向带偏很远。
+    // 显式检查能给出准确的原因。
+    //
+    // vkEnumerateInstanceVersion 本身是 1.1 引入的，但它是 global 级函数，
+    // volk 在 volkLoadLoader 阶段（早于 instance 创建）就已加载；
+    // 真正的 1.0 loader 上它会是 nullptr，那种情况按 1.0 处理。
+    uint32_t loaderVersion = VK_API_VERSION_1_0;
+    if (vkEnumerateInstanceVersion != nullptr) {
+        VK_CHECK(vkEnumerateInstanceVersion(&loaderVersion));
+    }
+    spdlog::info("Vulkan loader 版本: {}.{}.{}", VK_API_VERSION_MAJOR(loaderVersion),
+                 VK_API_VERSION_MINOR(loaderVersion), VK_API_VERSION_PATCH(loaderVersion));
+
+    if (loaderVersion < kRequiredApiVersion) {
+        throw std::runtime_error(
+            "本机 Vulkan loader 只支持 " + std::to_string(VK_API_VERSION_MAJOR(loaderVersion)) +
+            "." + std::to_string(VK_API_VERSION_MINOR(loaderVersion)) +
+            "，本工程需要 1.3（dynamic rendering 进入核心的版本）。\n"
+            "  Windows: 更新显卡驱动，或装新版 Vulkan Runtime\n"
+            "  Android: 需要 Android 13 (API 33) 及以上 —— 平台只暴露 1.0.3 / 1.1 / 1.3 三档");
+    }
+
     VkApplicationInfo appInfo{};
     appInfo.sType            = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "Origin";
     appInfo.pEngineName      = "none";
-    appInfo.apiVersion       = VK_API_VERSION_1_0;
+    appInfo.apiVersion       = kRequiredApiVersion;
 
     // 平台相关的 surface 扩展由 SDL 给出。
     // Android 上会返回 VK_KHR_surface + VK_KHR_android_surface，
@@ -397,37 +456,111 @@ void VulkanRenderer::pickPhysicalDevice() {
     std::vector<VkPhysicalDevice> devices(count);
     VK_CHECK(vkEnumeratePhysicalDevices(instance_, &count, devices.data()));
 
-    // 移动端基本只有一个集成 GPU，不需要打分排序：
-    // 找到第一个「同时支持图形和呈现」的队列族即可。
+    // 必须打分，不能取第一个。
+    //
+    // 早期版本的注释写的是「移动端基本只有一个集成 GPU，不需要打分」——
+    // 这在桌面双显卡机器上不成立，而且 vkEnumeratePhysicalDevices 的顺序
+    // 并不保证稳定。本机就有 RTX 3080（报 1.4）与 Intel UHD 630（只报 1.2），
+    // 取第一个会在两者之间随机漂移。
+    //
+    // 抬到 1.3 基线后这件事从「性能测量可能跑错设备」升级为「启动直接失败」，
+    // 所以这里做两件事：**先按能力硬过滤，再按类型打分**。
+    struct Candidate {
+        VkPhysicalDevice device = VK_NULL_HANDLE;
+        uint32_t         queueFamily = 0;
+        int              score = -1;
+        std::string      name;
+    };
+    Candidate best;
+
     for (VkPhysicalDevice dev : devices) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(dev, &props);
+
+        // ---- 硬过滤 1：设备自身的 API 版本 ----------------------------------
+        // instance 支持 1.3 不代表每个物理设备都支持。Intel UHD 630 就是
+        // 典型反例：同一台机器上 loader 报 1.4，它自己只报 1.2.148。
+        if (props.apiVersion < kRequiredApiVersion) {
+            spdlog::info("跳过 GPU {}：只支持 API {}.{}.{}，需要 1.3", props.deviceName,
+                         VK_API_VERSION_MAJOR(props.apiVersion),
+                         VK_API_VERSION_MINOR(props.apiVersion),
+                         VK_API_VERSION_PATCH(props.apiVersion));
+            continue;
+        }
+
+        // ---- 硬过滤 2：dynamicRendering 特性 --------------------------------
+        // 1.3 设备**必须**支持 dynamicRendering（它是核心特性而非可选），
+        // 但仍然查一遍：驱动 bug 与 Android 上的各种转译层都出现过
+        // 声称 1.3 却把某个核心特性报成 false 的情况。
+        // 查询用 vkGetPhysicalDeviceFeatures2（1.1+），上面已确认设备 >= 1.3。
+        VkPhysicalDeviceVulkan13Features vk13{};
+        vk13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        VkPhysicalDeviceFeatures2 feats{};
+        feats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        feats.pNext = &vk13;
+        vkGetPhysicalDeviceFeatures2(dev, &feats);
+        if (vk13.dynamicRendering != VK_TRUE || vk13.synchronization2 != VK_TRUE) {
+            spdlog::warn("跳过 GPU {}：声称 API 1.3 但 dynamicRendering={} / "
+                         "synchronization2={}",
+                         props.deviceName, vk13.dynamicRendering == VK_TRUE,
+                         vk13.synchronization2 == VK_TRUE);
+            continue;
+        }
+
+        // ---- 硬过滤 3：同时支持图形与呈现的队列族 ---------------------------
         uint32_t qCount = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(dev, &qCount, nullptr);
         std::vector<VkQueueFamilyProperties> qProps(qCount);
         vkGetPhysicalDeviceQueueFamilyProperties(dev, &qCount, qProps.data());
 
+        uint32_t family      = 0;
+        bool     familyFound = false;
         for (uint32_t i = 0; i < qCount; ++i) {
             if (!(qProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
                 continue;
             }
             VkBool32 presentSupport = VK_FALSE;
             VK_CHECK(vkGetPhysicalDeviceSurfaceSupportKHR(dev, i, surface_, &presentSupport));
-            if (presentSupport != VK_TRUE) {
-                continue;
+            if (presentSupport == VK_TRUE) {
+                family      = i;
+                familyFound = true;
+                break;
             }
+        }
+        if (!familyFound) {
+            continue;
+        }
 
-            physicalDevice_   = dev;
-            queueFamilyIndex_ = i;
+        // ---- 打分：独显优先 --------------------------------------------------
+        // Android 上只有集成 GPU，自然落到 2 分，不受影响。
+        int score = 0;
+        switch (props.deviceType) {
+            case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   score = 3; break;
+            case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: score = 2; break;
+            case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    score = 1; break;
+            default:                                     score = 0; break;  // CPU / OTHER
+        }
 
-            VkPhysicalDeviceProperties props{};
-            vkGetPhysicalDeviceProperties(dev, &props);
-            spdlog::info("选中 GPU: {} (driver {}, API {}.{}.{})", props.deviceName,
-                         props.driverVersion, VK_VERSION_MAJOR(props.apiVersion),
-                         VK_VERSION_MINOR(props.apiVersion),
-                         VK_VERSION_PATCH(props.apiVersion));
-            return;
+        spdlog::info("候选 GPU: {} (API {}.{}.{}, 类型 {}, 得分 {})", props.deviceName,
+                     VK_API_VERSION_MAJOR(props.apiVersion),
+                     VK_API_VERSION_MINOR(props.apiVersion),
+                     VK_API_VERSION_PATCH(props.apiVersion),
+                     static_cast<int>(props.deviceType), score);
+
+        if (score > best.score) {
+            best = Candidate{dev, family, score, props.deviceName};
         }
     }
-    throw std::runtime_error("没有找到同时支持图形与呈现的队列族");
+
+    if (best.device == VK_NULL_HANDLE) {
+        throw std::runtime_error(
+            "没有找到满足要求的 GPU：需要 Vulkan 1.3 + dynamicRendering + "
+            "图形与呈现队列。上面的日志列出了每个被跳过的设备及原因。");
+    }
+
+    physicalDevice_   = best.device;
+    queueFamilyIndex_ = best.queueFamily;
+    spdlog::info("选中 GPU: {} (得分 {})", best.name, best.score);
 }
 
 void VulkanRenderer::createDevice() {
@@ -441,18 +574,80 @@ void VulkanRenderer::createDevice() {
 
     const char* deviceExtensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
-    VkPhysicalDeviceFeatures features{};  // hello triangle 不需要任何可选特性
+    // dynamicRendering 虽然是 1.3 的核心特性，但**仍然必须显式启用**。
+    // Vulkan 的规矩是「核心特性也要 opt-in」，不开就用 vkCmdBeginRendering
+    // 会被校验层判为非法使用（部分驱动上直接是未定义行为）。
+    //
+    // 注意不需要启 VK_KHR_dynamic_rendering 扩展 —— 设备已是 1.3，
+    // 核心入口 vkCmdBeginRendering 直接可用（pickPhysicalDevice 已硬过滤）。
+    VkPhysicalDeviceVulkan13Features vk13{};
+    vk13.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    vk13.dynamicRendering = VK_TRUE;
+    // Synchronization2 同样是 1.3 核心特性，同样要显式 opt-in。
+    // 它不改变同步的**语义**，只是把 stage/access 掩码从 32 位扩到 64 位、
+    // 把 barrier 的 stage 从「整条 vkCmdPipelineBarrier 一份」细化到
+    // 「每个 barrier 一份」，于是能表达以前表达不了的精确依赖。
+    // 顺带还有 VK_PIPELINE_STAGE_2_NONE 这种以前只能用
+    // TOP_OF_PIPE/BOTTOM_OF_PIPE 凑的语义。
+    vk13.synchronization2 = VK_TRUE;
+
+    VkPhysicalDeviceFeatures2 features2{};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &vk13;
+    // features2.features 全 false —— 目前不需要任何 1.0 级可选特性
 
     VkDeviceCreateInfo info{};
     info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    info.pNext                   = &features2;
     info.queueCreateInfoCount    = 1;
     info.pQueueCreateInfos       = &queueInfo;
     info.enabledExtensionCount   = 1;
     info.ppEnabledExtensionNames = deviceExtensions;
-    info.pEnabledFeatures        = &features;
+    // 用 VkPhysicalDeviceFeatures2 挂在 pNext 时，pEnabledFeatures **必须为 NULL**，
+    // 两个一起填是规范明令禁止的（VUID-VkDeviceCreateInfo-pNext-00373）。
+    // 1.0 级特性改为填 features2.features。
+    info.pEnabledFeatures = nullptr;
 
     VK_CHECK(vkCreateDevice(physicalDevice_, &info, nullptr, &device_));
     vkGetDeviceQueue(device_, queueFamilyIndex_, 0, &queue_);
+}
+
+void VulkanRenderer::createAllocator() {
+    // VMA 需要一组 Vulkan 函数指针。因为工程用 volk（VK_NO_PROTOTYPES），
+    // 不能让它去引用静态原型，所以走 VMA_DYNAMIC_VULKAN_FUNCTIONS=1：
+    // 只把两个 getter 交给它，剩下三十多个由它自己 fetch。
+    //
+    // 新版 VMA 里这两个字段有 VMA_ASSERT 强制检查，漏填会在 Debug 下直接断言，
+    // Release 下则是空指针调用 —— 不是"可选优化"。
+    VmaVulkanFunctions fns{};
+    fns.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+    fns.vkGetDeviceProcAddr   = vkGetDeviceProcAddr;
+
+    VmaAllocatorCreateInfo info{};
+    info.instance         = instance_;
+    info.physicalDevice   = physicalDevice_;
+    info.device           = device_;
+    info.pVulkanFunctions = &fns;
+    // 必须和实际创建 instance 时用的版本一致。填高了 VMA 会尝试调用
+    // 设备并未暴露的入口；填低了则用不上 1.1 起的 vkBindBufferMemory2 /
+    // vkGetBufferMemoryRequirements2（dedicated allocation 依赖它们）。
+    info.vulkanApiVersion = kRequiredApiVersion;
+
+    VK_CHECK(vmaCreateAllocator(&info, &allocator_));
+
+    // 打一下堆信息：移动端往往只有一个 DEVICE_LOCAL | HOST_VISIBLE 的堆
+    // （统一内存），桌面独显则是分离的。做内存相关的性能判断时这是前提。
+    const VkPhysicalDeviceMemoryProperties* memProps = nullptr;
+    vmaGetMemoryProperties(allocator_, &memProps);
+    spdlog::info("VMA 已就绪: {} 个 memory type, {} 个 heap", memProps->memoryTypeCount,
+                 memProps->memoryHeapCount);
+    for (uint32_t i = 0; i < memProps->memoryHeapCount; ++i) {
+        const bool deviceLocal =
+            (memProps->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+        spdlog::info("  heap {}: {} MB{}", i,
+                     memProps->memoryHeaps[i].size / (1024 * 1024),
+                     deviceLocal ? "  [DEVICE_LOCAL]" : "");
+    }
 }
 
 // =============================================================================
@@ -595,29 +790,20 @@ void VulkanRenderer::destroyDepthResources() {
         depthView_ = VK_NULL_HANDLE;
     }
     if (depthImage_ != VK_NULL_HANDLE) {
-        vkDestroyImage(device_, depthImage_, nullptr);
+        vmaDestroyImage(allocator_, depthImage_, depthAlloc_);
         depthImage_ = VK_NULL_HANDLE;
-    }
-    if (depthMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device_, depthMemory_, nullptr);
-        depthMemory_ = VK_NULL_HANDLE;
+        depthAlloc_ = VK_NULL_HANDLE;
     }
 }
 
 void VulkanRenderer::destroySwapchainDependents() {
     // 截图缓冲的大小跟 swapchain 尺寸绑定，尺寸变了必须重建
     if (screenshotBuffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, screenshotBuffer_, nullptr);
-        vkFreeMemory(device_, screenshotMemory_, nullptr);
+        vmaDestroyBuffer(allocator_, screenshotBuffer_, screenshotAlloc_);
         screenshotBuffer_ = VK_NULL_HANDLE;
-        screenshotMemory_ = VK_NULL_HANDLE;
+        screenshotAlloc_  = VK_NULL_HANDLE;
         screenshotSize_   = 0;
     }
-
-    for (VkFramebuffer fb : framebuffers_) {
-        vkDestroyFramebuffer(device_, fb, nullptr);
-    }
-    framebuffers_.clear();
 
     destroyDepthResources();
 
@@ -641,34 +827,31 @@ void VulkanRenderer::recreateSwapchain() {
 
     vkDeviceWaitIdle(device_);
 
-    // 注意这里没有销毁 pipeline 与 renderPass：
-    // pipeline 的 viewport/scissor 是动态状态，renderPass 只依赖格式（未变），
-    // 因此两者都能跨 swapchain 重建复用 —— 这是避免转屏卡顿的关键。
-    for (VkFramebuffer fb : framebuffers_) {
-        vkDestroyFramebuffer(device_, fb, nullptr);
-    }
-    framebuffers_.clear();
+    // 注意这里没有销毁 pipeline：
+    // viewport/scissor 是动态状态，而 pipeline 里那份 VkPipelineRenderingCreateInfo
+    // 只记录**附件格式**（颜色格式与深度格式跨重建都没变），
+    // 所以 pipeline 能直接复用 —— 这是避免转屏卡顿的关键。
+    //
+    // 改用 dynamic rendering 后还额外省掉了 framebuffer 的重建：
+    // 以前每次重建 swapchain 都要销毁并重建 N 个 VkFramebuffer，现在没有这个对象了。
     for (VkImageView v : swapchainImageViews_) {
         vkDestroyImageView(device_, v, nullptr);
     }
     swapchainImageViews_.clear();
 
     if (screenshotBuffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, screenshotBuffer_, nullptr);
-        vkFreeMemory(device_, screenshotMemory_, nullptr);
+        vmaDestroyBuffer(allocator_, screenshotBuffer_, screenshotAlloc_);
         screenshotBuffer_  = VK_NULL_HANDLE;
-        screenshotMemory_  = VK_NULL_HANDLE;
+        screenshotAlloc_   = VK_NULL_HANDLE;
         screenshotSize_    = 0;
         screenshotPending_ = false;  // 尺寸变了，这次截图作废
     }
 
-    // 深度缓冲的尺寸跟 swapchain 绑定，必须一起重建。
-    // renderPass 只依赖**格式**（颜色格式与深度格式都没变），所以仍可复用。
+    // 深度缓冲的尺寸跟 swapchain 绑定，必须一起重建
     destroyDepthResources();
 
     createSwapchain();
     createDepthResources();
-    createFramebuffers();
 
     // swapchain image 数量可能变化，按 image 分配的信号量必须跟着重建
     for (VkSemaphore s : renderFinishedSemaphores_) {
@@ -691,77 +874,8 @@ void VulkanRenderer::recreateSwapchain() {
 }
 
 // =============================================================================
-// RenderPass / Pipeline / Framebuffer
+// Pipeline
 // =============================================================================
-
-void VulkanRenderer::createRenderPass() {
-    VkAttachmentDescription color{};
-    color.format         = swapchainFormat_;
-    color.samples        = VK_SAMPLE_COUNT_1_BIT;
-    color.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-    color.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    color.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-    color.finalLayout    = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-    // 深度附件：storeOp = DONT_CARE 很关键。
-    // 深度值出了本 pass 就没人再读，声明为 DONT_CARE 能让 Mali/Adreno 的
-    // tile 架构完全跳过把深度写回主存这一步，是移动端最省带宽的一处改动。
-    VkAttachmentDescription depth{};
-    depth.format         = depthFormat_;
-    depth.samples        = VK_SAMPLE_COUNT_1_BIT;
-    depth.loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-    depth.finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-    VkAttachmentReference colorRef{};
-    colorRef.attachment = 0;
-    colorRef.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-    VkAttachmentReference depthRef{};
-    depthRef.attachment = 1;
-    depthRef.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-    VkSubpassDescription subpass{};
-    subpass.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount    = 1;
-    subpass.pColorAttachments       = &colorRef;
-    subpass.pDepthStencilAttachment = &depthRef;
-
-    // 这条依赖保证「呈现引擎读完上一帧」与「本帧开始写颜色附件」之间有正确屏障。
-    // 少了它会出现间歇性撕裂，校验层也会报 layout transition 竞争。
-    //
-    // 加了深度后 stage/access 掩码必须一并扩上 EARLY_FRAGMENT_TESTS 与
-    // DEPTH_STENCIL_ATTACHMENT_WRITE —— 只写颜色那份掩码会让校验层
-    // 报深度附件的 layout transition 缺少同步。
-    VkSubpassDependency dep{};
-    dep.srcSubpass    = VK_SUBPASS_EXTERNAL;
-    dep.dstSubpass    = 0;
-    dep.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dep.srcAccessMask = 0;
-    dep.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-    const VkAttachmentDescription attachments[] = {color, depth};
-
-    VkRenderPassCreateInfo info{};
-    info.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    info.attachmentCount = 2;
-    info.pAttachments    = attachments;
-    info.subpassCount    = 1;
-    info.pSubpasses      = &subpass;
-    info.dependencyCount = 1;
-    info.pDependencies   = &dep;
-
-    VK_CHECK(vkCreateRenderPass(device_, &info, nullptr, &renderPass_));
-}
 
 void VulkanRenderer::createPipeline() {
     // ---- 反射驱动的 layout 生成 --------------------------------------------
@@ -878,8 +992,26 @@ void VulkanRenderer::createPipeline() {
     depthStencil.minDepthBounds   = 0.0f;
     depthStencil.maxDepthBounds   = 1.0f;
 
+    // ---- dynamic rendering：用附件格式替代 VkRenderPass --------------------
+    // 没有 renderPass 对象了，但 pipeline 仍需知道附件的**格式**（驱动要用它
+    // 决定输出转换与深度比较的精度），所以把格式通过 pNext 带进去。
+    //
+    // 只记录格式、不记录尺寸，这正是 pipeline 能跨 swapchain 重建复用的原因
+    // （见 recreateSwapchain）。
+    const VkFormat colorFormat = swapchainFormat_;
+
+    VkPipelineRenderingCreateInfo renderingInfo{};
+    renderingInfo.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderingInfo.colorAttachmentCount    = 1;
+    renderingInfo.pColorAttachmentFormats = &colorFormat;
+    renderingInfo.depthAttachmentFormat   = depthFormat_;
+    // stencilAttachmentFormat 留 UNDEFINED：深度格式可能自带 stencil 位
+    // （如 D32_SFLOAT_S8_UINT），但我们不用 stencil，声明为 UNDEFINED 让驱动
+    // 知道无需为它保留资源。
+
     VkGraphicsPipelineCreateInfo info{};
     info.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    info.pNext               = &renderingInfo;
     info.stageCount          = 2;
     info.pStages             = stages;
     info.pVertexInputState   = &vertexInput;
@@ -891,32 +1023,13 @@ void VulkanRenderer::createPipeline() {
     info.pColorBlendState    = &blend;
     info.pDynamicState       = &dynamicState;
     info.layout              = program_.layout;  // 反射生成
-    info.renderPass          = renderPass_;
-    info.subpass             = 0;
+    // dynamic rendering 下必须是 VK_NULL_HANDLE，subpass 被忽略
+    info.renderPass          = VK_NULL_HANDLE;
 
     VK_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline_));
 
     // shader module 不在这里销毁：它们归 vertexStage_ / pixelStage_ 所有，
     // 在 shutdown() 里统一由 destroyShaderStage 处理。
-}
-
-void VulkanRenderer::createFramebuffers() {
-    framebuffers_.resize(swapchainImageViews_.size());
-    for (size_t i = 0; i < swapchainImageViews_.size(); ++i) {
-        // 深度 image 只有一张、被所有 swapchain image 共用：
-        // 同一时刻只有一帧在写深度（fence 保证），不需要每张一份。
-        const VkImageView attachments[] = {swapchainImageViews_[i], depthView_};
-
-        VkFramebufferCreateInfo info{};
-        info.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        info.renderPass      = renderPass_;
-        info.attachmentCount = 2;
-        info.pAttachments    = attachments;
-        info.width           = swapchainExtent_.width;
-        info.height          = swapchainExtent_.height;
-        info.layers          = 1;
-        VK_CHECK(vkCreateFramebuffer(device_, &info, nullptr, &framebuffers_[i]));
-    }
 }
 
 // =============================================================================
@@ -967,20 +1080,104 @@ void VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageInde
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
 
-    // clearValues 的下标必须与 renderPass 的 attachment 顺序一致
-    VkClearValue clears[2]{};
-    clears[0].color = {{0.05f, 0.06f, 0.09f, 1.0f}};  // 深蓝灰，区分「没画」与「画黑了」
-    clears[1].depthStencil = {1.0f, 0};               // 常规深度：远平面是 1.0
+    // ---- layout 转换：dynamic rendering 下必须手写 --------------------------
+    // 这是从 renderpass 迁过来时最容易漏的一步。
+    // 以前 VkAttachmentDescription 的 initialLayout/finalLayout 会让驱动
+    // 在 pass 边界自动插入转换，现在没有 pass 对象，得自己来。
+    //
+    // 两个 barrier 完全对应原先那份 renderPass 的语义：
+    //   颜色：UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL（结束后再转 PRESENT_SRC）
+    //   深度：UNDEFINED -> DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+    // 用 UNDEFINED 作为 oldLayout 表示「丢弃原有内容」，这与 loadOp=CLEAR
+    // 是一致的，在 tile 架构上也避免了把旧内容读回 tile 内存。
+    //
+    // 这一处同时替代了原先那条 VkSubpassDependency(EXTERNAL -> 0)：
+    // srcStage 取 COLOR_ATTACHMENT_OUTPUT 而不是 TOP_OF_PIPE，是为了和
+    // 「上一帧对这张 image 的写入」排序 —— 取 TOP_OF_PIPE 校验层不报错，
+    // 但在 swapchain image 被复用时存在写后写竞争。
+    // 用 Synchronization2（VkImageMemoryBarrier2 + vkCmdPipelineBarrier2）。
+    // 相比 sync1 的实际差别在这里就能看到：**stage 掩码是每个 barrier 独立的**。
+    // sync1 只能给整条 vkCmdPipelineBarrier 一组 src/dstStage，所以颜色和深度
+    // 两个 barrier 被迫共享 `COLOR_ATTACHMENT_OUTPUT | EARLY_FRAGMENT_TESTS`
+    // 的并集 —— 等于告诉驱动「颜色附件也要等 early-Z 阶段」，是过度同步。
+    // sync2 下各自只声明自己真正涉及的阶段。
+    VkImageMemoryBarrier2 toAttachment[2]{};
 
-    VkRenderPassBeginInfo rp{};
-    rp.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rp.renderPass        = renderPass_;
-    rp.framebuffer       = framebuffers_[imageIndex];
-    rp.renderArea.extent = swapchainExtent_;
-    rp.clearValueCount   = 2;
-    rp.pClearValues      = clears;
+    toAttachment[0].sType     = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    toAttachment[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toAttachment[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    // srcStage 取 COLOR_ATTACHMENT_OUTPUT 是为了和「上一帧对这张 image 的写入」
+    // 排序（swapchain image 会被复用）。取 TOP_OF_PIPE 校验层不报错但有写后写竞争。
+    toAttachment[0].srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toAttachment[0].srcAccessMask = VK_ACCESS_2_NONE;
+    toAttachment[0].dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toAttachment[0].dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toAttachment[0].srcQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[0].dstQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[0].image                       = swapchainImages_[imageIndex];
+    toAttachment[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toAttachment[0].subresourceRange.levelCount = 1;
+    toAttachment[0].subresourceRange.layerCount = 1;
 
-    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    toAttachment[1].sType     = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    toAttachment[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toAttachment[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    // 深度只涉及 early/late fragment tests，和颜色附件输出无关 ——
+    // 这就是上面说的「不再被迫取并集」。
+    toAttachment[1].srcStageMask  = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                   VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toAttachment[1].srcAccessMask = VK_ACCESS_2_NONE;
+    toAttachment[1].dstStageMask  = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+    toAttachment[1].dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toAttachment[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment[1].image               = depthImage_;
+    // aspectMask 要按实际格式给：带 stencil 的深度格式必须把 STENCIL_BIT 也标上，
+    // 否则校验层报 subresource 不完整。
+    toAttachment[1].subresourceRange.aspectMask = depthAspectMask(depthFormat_);
+    toAttachment[1].subresourceRange.levelCount = 1;
+    toAttachment[1].subresourceRange.layerCount = 1;
+
+    VkDependencyInfo toAttachmentDep{};
+    toAttachmentDep.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    toAttachmentDep.imageMemoryBarrierCount = 2;
+    toAttachmentDep.pImageMemoryBarriers    = toAttachment;
+    vkCmdPipelineBarrier2(cmd, &toAttachmentDep);
+
+    // ---- 附件描述：取代 renderPass + framebuffer ----------------------------
+    VkRenderingAttachmentInfo colorAttachment{};
+    colorAttachment.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    colorAttachment.imageView   = swapchainImageViews_[imageIndex];
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+    // 深蓝灰，便于区分「没画」与「画黑了」
+    colorAttachment.clearValue.color = {{0.05f, 0.06f, 0.09f, 1.0f}};
+
+    VkRenderingAttachmentInfo depthAttachment{};
+    depthAttachment.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depthAttachment.imageView   = depthView_;
+    depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthAttachment.loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    // storeOp = DONT_CARE 是移动端最省带宽的一处声明，迁移时务必保留：
+    // 深度值出了本次 rendering 就没人再读，Mali/Adreno 的 tile 架构据此
+    // 完全跳过「把 tile 内的深度写回主存」这一步。
+    depthAttachment.storeOp                 = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.clearValue.depthStencil = {1.0f, 0};  // 常规深度：远平面 1.0
+
+    VkRenderingInfo rendering{};
+    rendering.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering.renderArea.extent    = swapchainExtent_;
+    // layerCount 必须 >= 1。留 0 是从 renderpass 迁过来时的高频错误：
+    // VkFramebufferCreateInfo 里叫 layers 且我们填的是 1，这里字段改了名，
+    // 漏填会被校验层拦下（VUID-VkRenderingInfo-viewMask-06069）。
+    rendering.layerCount           = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments    = &colorAttachment;
+    rendering.pDepthAttachment     = &depthAttachment;
+    // pStencilAttachment 留 nullptr —— 不用 stencil
+
+    vkCmdBeginRendering(cmd, &rendering);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
 
     VkViewport viewport{};
@@ -1101,37 +1298,61 @@ void VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageInde
         pushAndDraw(glm::mat4(1.0f), 0, indexCount_, 0);
     }
 
-    // ImGui 必须画在同一个 render pass 内、且在 cube 之后（它不写深度，
-    // 要靠绘制顺序盖在场景上面）。
+    // ImGui 必须画在同一次 vkCmdBeginRendering/EndRendering 之间、且在 cube 之后
+    // （它不写深度，要靠绘制顺序盖在场景上面）。
+    //
+    // 这也是本工程 swapchain 走 preTransform=IDENTITY 而非 pre-rotation 的原因：
+    // imgui 后端内部自建正交矩阵并自己调 vkCmdSetViewport，拿不到我们的
+    // pre-rotation 矩阵，走 pre-rotation 会把面板转歪。
     if (imguiReady_) {
         if (ImDrawData* drawData = ImGui::GetDrawData()) {
             ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
         }
     }
 
-    vkCmdEndRenderPass(cmd);
+    vkCmdEndRendering(cmd);
 
-    // 截图的 copy 刻意放在这里、而不是单独提交一次一次性命令：
-    // 此刻这张 swapchain image 是本帧 acquire 到的、由本 command buffer 合法持有，
-    // 所以 PRESENT_SRC -> TRANSFER_SRC -> PRESENT_SRC 的来回转换是干净的。
-    // 若改成在 present 之后另起一个 command buffer 去转换，校验层会报
+    // ---- 收尾：把颜色附件转到可呈现的 layout -------------------------------
+    // 这一步以前由 VkAttachmentDescription::finalLayout = PRESENT_SRC_KHR 免费完成，
+    // dynamic rendering 下必须显式写出来。漏掉它 vkQueuePresentKHR 会报
+    // 「image layout 不是 PRESENT_SRC_KHR」。
+    //
+    // 截图路径顺带比以前少一次转换：从前是
+    //   COLOR_ATTACHMENT -> PRESENT_SRC -> TRANSFER_SRC -> PRESENT_SRC（三次）
+    // 现在直接
+    //   COLOR_ATTACHMENT -> TRANSFER_SRC -> PRESENT_SRC（两次）
+    // 因为 present 前的那次转换本来就还没发生，我们可以插在中间。
+    //
+    // copy 仍然刻意放在当帧的 command buffer 里而不是另起一次性提交：
+    // 此刻这张 swapchain image 是本帧 acquire 到的、由本 command buffer 合法持有。
+    // 若在 present 之后另起 command buffer 去转换，校验层会报
     // 「performs a layout transition on presentable image ... has not been acquired」。
-    if (screenshotPending_ && screenshotBuffer_ != VK_NULL_HANDLE) {
-        VkImageMemoryBarrier toSrc{};
-        toSrc.sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        toSrc.oldLayout                   = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        toSrc.newLayout                   = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        toSrc.srcQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
-        toSrc.dstQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
-        toSrc.image                       = swapchainImages_[imageIndex];
-        toSrc.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        toSrc.subresourceRange.levelCount = 1;
-        toSrc.subresourceRange.layerCount = 1;
-        toSrc.srcAccessMask               = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        toSrc.dstAccessMask               = VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                             &toSrc);
+    VkImageMemoryBarrier2 colorBarrier{};
+    colorBarrier.sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    colorBarrier.srcQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
+    colorBarrier.dstQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
+    colorBarrier.image                       = swapchainImages_[imageIndex];
+    colorBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    colorBarrier.subresourceRange.levelCount = 1;
+    colorBarrier.subresourceRange.layerCount = 1;
+    colorBarrier.oldLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorBarrier.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    colorBarrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+
+    VkDependencyInfo dep{};
+    dep.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.imageMemoryBarrierCount = 1;
+
+    const bool doScreenshot = screenshotPending_ && screenshotBuffer_ != VK_NULL_HANDLE;
+
+    if (doScreenshot) {
+        // VK_PIPELINE_STAGE_2_COPY_BIT 比 sync1 只能用的 TRANSFER_BIT 更精确：
+        // 后者是 copy/blit/resolve/clear 四类的并集，这里只做 copy。
+        colorBarrier.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        colorBarrier.dstStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
+        colorBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        dep.pImageMemoryBarriers   = &colorBarrier;
+        vkCmdPipelineBarrier2(cmd, &dep);
 
         VkBufferImageCopy region{};
         region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1141,14 +1362,23 @@ void VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageInde
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, screenshotBuffer_, 1,
                                &region);
 
-        VkImageMemoryBarrier back = toSrc;
-        back.oldLayout            = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        back.newLayout            = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        back.srcAccessMask        = VK_ACCESS_TRANSFER_READ_BIT;
-        back.dstAccessMask        = 0;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
-                             nullptr, 1, &back);
+        VkImageMemoryBarrier2 toPresent = colorBarrier;
+        toPresent.oldLayout             = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toPresent.newLayout             = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        toPresent.srcStageMask          = VK_PIPELINE_STAGE_2_COPY_BIT;
+        toPresent.srcAccessMask         = VK_ACCESS_2_TRANSFER_READ_BIT;
+        // 转到 PRESENT_SRC 之后没有后续的 GPU 访问需要等它，
+        // 用 NONE 是 sync2 才有的准确表达（sync1 只能拿 BOTTOM_OF_PIPE 凑）。
+        toPresent.dstStageMask   = VK_PIPELINE_STAGE_2_NONE;
+        toPresent.dstAccessMask  = VK_ACCESS_2_NONE;
+        dep.pImageMemoryBarriers = &toPresent;
+        vkCmdPipelineBarrier2(cmd, &dep);
+    } else {
+        colorBarrier.newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        colorBarrier.dstStageMask  = VK_PIPELINE_STAGE_2_NONE;
+        colorBarrier.dstAccessMask = VK_ACCESS_2_NONE;
+        dep.pImageMemoryBarriers   = &colorBarrier;
+        vkCmdPipelineBarrier2(cmd, &dep);
     }
 
     VK_CHECK(vkEndCommandBuffer(cmd));
@@ -1208,19 +1438,36 @@ void VulkanRenderer::drawFrame() {
     VK_CHECK(vkResetCommandBuffer(cmd, 0));
     recordCommandBuffer(cmd, imageIndex);
 
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    // vkQueueSubmit2（sync2）：信号量的等待/触发阶段各自成结构体，
+    // 不再是「一个 pWaitSemaphores 数组 + 一个平行的 pWaitDstStageMask 数组」
+    // 那种靠下标对应的写法 —— 后者数组长度写错不会被编译器发现。
+    VkSemaphoreSubmitInfo waitSem{};
+    waitSem.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    waitSem.semaphore = imageAvailableSemaphores_[currentFrame_];
+    waitSem.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
 
-    VkSubmitInfo submit{};
-    submit.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.waitSemaphoreCount   = 1;
-    submit.pWaitSemaphores      = &imageAvailableSemaphores_[currentFrame_];
-    submit.pWaitDstStageMask    = &waitStage;
-    submit.commandBufferCount   = 1;
-    submit.pCommandBuffers      = &cmd;
-    submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores    = &renderFinishedSemaphores_[imageIndex];  // 按 image 取
+    VkSemaphoreSubmitInfo signalSem{};
+    signalSem.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    signalSem.semaphore = renderFinishedSemaphores_[imageIndex];  // 按 image 取
+    // 触发阶段也能指定了。sync1 的 pSignalSemaphores 没有对应字段，
+    // 语义上等价于 ALL_COMMANDS —— 即「整个 command buffer 全跑完才触发」。
+    // 这里只需要颜色附件写完，present 就能开始。
+    signalSem.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
 
-    VK_CHECK(vkQueueSubmit(queue_, 1, &submit, inFlightFences_[currentFrame_]));
+    VkCommandBufferSubmitInfo cmdInfo{};
+    cmdInfo.sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmdInfo.commandBuffer = cmd;
+
+    VkSubmitInfo2 submit{};
+    submit.sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit.waitSemaphoreInfoCount   = 1;
+    submit.pWaitSemaphoreInfos      = &waitSem;
+    submit.commandBufferInfoCount   = 1;
+    submit.pCommandBufferInfos      = &cmdInfo;
+    submit.signalSemaphoreInfoCount = 1;
+    submit.pSignalSemaphoreInfos    = &signalSem;
+
+    VK_CHECK(vkQueueSubmit2(queue_, 1, &submit, inFlightFences_[currentFrame_]));
 
     VkPresentInfoKHR present{};
     present.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -1266,15 +1513,18 @@ void VulkanRenderer::ensureScreenshotBuffer() {
     }
 
     if (screenshotBuffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device_, screenshotBuffer_, nullptr);
-        vkFreeMemory(device_, screenshotMemory_, nullptr);
+        vmaDestroyBuffer(allocator_, screenshotBuffer_, screenshotAlloc_);
         screenshotBuffer_ = VK_NULL_HANDLE;
-        screenshotMemory_ = VK_NULL_HANDLE;
+        screenshotAlloc_  = VK_NULL_HANDLE;
     }
 
+    // HOST_ACCESS_RANDOM 而非 SEQUENTIAL_WRITE：这个 buffer 是给 CPU **读**的
+    // （GPU 写进来、我们 memcpy 出去）。用 SEQUENTIAL_WRITE 会让 VMA 挑
+    // uncached 内存，CPU 读它会慢到离谱 —— 方向填反是个很容易犯的错。
     createBuffer(need, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 screenshotBuffer_, screenshotMemory_);
+                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                     VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                 screenshotBuffer_, screenshotAlloc_);
     screenshotSize_ = need;
 }
 
@@ -1284,12 +1534,16 @@ void VulkanRenderer::writePendingScreenshot() {
         return;
     }
 
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(device_, screenshotMemory_, 0, screenshotSize_, 0, &mapped));
+    // GPU 刚写完这块内存，CPU 读之前必须 invalidate。
+    // 内存恰好是 HOST_COHERENT 时它是空操作，但不能因此省掉 ——
+    // VMA 的 AUTO 有可能挑到 non-coherent 的类型，那时漏了就会读到旧数据。
+    VK_CHECK(vmaInvalidateAllocation(allocator_, screenshotAlloc_, 0, screenshotSize_));
+
+    VmaAllocationInfo shotInfo{};
+    vmaGetAllocationInfo(allocator_, screenshotAlloc_, &shotInfo);
 
     std::vector<uint8_t> rgba(static_cast<size_t>(screenshotSize_));
-    std::memcpy(rgba.data(), mapped, rgba.size());
-    vkUnmapMemory(device_, screenshotMemory_);
+    std::memcpy(rgba.data(), shotInfo.pMappedData, rgba.size());
 
     // swapchain 在桌面端通常是 BGRA，写 PNG 前换成 RGBA
     if (swapchainFormat_ == VK_FORMAT_B8G8R8A8_UNORM ||
@@ -1412,7 +1666,7 @@ void VulkanRenderer::initImGui() {
     ImGui_ImplVulkan_InitInfo info{};
     // 必须和 createInstance 里 VkApplicationInfo::apiVersion 一致。
     // 填高了 imgui 会去用当前 instance 并不支持的入口，运行期才炸。
-    info.ApiVersion     = VK_API_VERSION_1_0;
+    info.ApiVersion     = kRequiredApiVersion;
     info.Instance       = instance_;
     info.PhysicalDevice = physicalDevice_;
     info.Device         = device_;
@@ -1429,9 +1683,44 @@ void VulkanRenderer::initImGui() {
     // 注意：imgui 在 2025/09/26 之后把 RenderPass / Subpass / MSAASamples
     // 从 InitInfo 顶层挪进了 PipelineInfoMain。照老教程写 info.RenderPass
     // 在 v1.92 上根本编不过。
-    info.PipelineInfoMain.RenderPass  = renderPass_;
-    info.PipelineInfoMain.Subpass     = 0;
     info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // ---- 让 imgui 也走 dynamic rendering -----------------------------------
+    // 这两样必须同时给，只给 UseDynamicRendering 不填 PipelineRenderingCreateInfo
+    // 的话 imgui 判定"信息不全"就不会建主管线，面板直接不显示 ——
+    // 它靠 sType 是否等于 VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO
+    // 来判断这个字段有没有被填过（见 imgui_impl_vulkan.h 的 ImGui_ImplVulkan_PipelineInfo）。
+    // PipelineInfoMain.RenderPass 此时被忽略，留 VK_NULL_HANDLE。
+    info.UseDynamicRendering = true;
+    info.PipelineInfoMain.PipelineRenderingCreateInfo       = {};
+    info.PipelineInfoMain.PipelineRenderingCreateInfo.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    info.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+    // ⚠️ 这里必须指向生命周期长于 imgui 的对象。
+    // imgui 按值保存 PipelineRenderingCreateInfo，但 pColorAttachmentFormats
+    // 是个裸指针、它不会深拷贝数组 —— 指向局部变量就是悬垂指针，
+    // 而且因为 Init 当场就会用一次，多数情况下"看起来能跑"，
+    // 等后面某次重建管线才炸。swapchainFormat_ 是成员，安全。
+    info.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats =
+        &swapchainFormat_;
+
+    // ⚠️ depthAttachmentFormat 必须填，即使 imgui 压根不读写深度。
+    //
+    // 这是 dynamic rendering 一条容易想错的规则：管线声明的附件格式要和
+    // vkCmdBeginRendering 传入的 VkRenderingInfo **逐个附件对齐**，
+    // 与该管线是否真的使用那个附件无关。我们的 VkRenderingInfo 带了
+    // pDepthAttachment，所以在同一次 rendering 里绘制的每一条管线
+    // （包括 imgui 的）都得声明同样的深度格式。
+    //
+    // 漏填的症状很有迷惑性：画面完全正常（imgui 的确不需要深度），
+    // 但校验层每帧刷
+    //   vkCmdDrawIndexed(): VkRenderingInfo::pDepthAttachment->imageView format
+    //   (VK_FORMAT_D32_SFLOAT) must match ... depthAttachmentFormat (VK_FORMAT_UNDEFINED)
+    // 而 vkCmdDrawIndexed 我们自己和 imgui 都在调，很容易误判成自己的管线配错了。
+    //
+    // 想真正「不声明用不到的附件」需要 VK_EXT_dynamic_rendering_unused_attachments，
+    // 移动端覆盖率差，不值得为此引入。
+    info.PipelineInfoMain.PipelineRenderingCreateInfo.depthAttachmentFormat = depthFormat_;
 
     // 让校验层的 best-practices 检查不再抱怨小块分配
     info.MinAllocationSize = 1024 * 1024;
@@ -1522,6 +1811,39 @@ void VulkanRenderer::buildUi() {
             ImGui::TextUnformatted("builtin cube (glTF load failed)");
         }
 
+        ImGui::SeparatorText("Memory (VMA)");
+        {
+            // vmaGetHeapBudgets 要按 heap 数量给数组，MAX_MEMORY_HEAPS 是上限。
+            // usage  = 我们自己分配出去的量
+            // budget = 驱动认为当前可用的量（会随其他进程的占用而变化，
+            //          比 heap 的物理大小更有参考价值）
+            VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+            vmaGetHeapBudgets(allocator_, budgets);
+
+            const VkPhysicalDeviceMemoryProperties* mp = nullptr;
+            vmaGetMemoryProperties(allocator_, &mp);
+
+            for (uint32_t i = 0; i < mp->memoryHeapCount; ++i) {
+                if (budgets[i].statistics.blockBytes == 0) {
+                    continue;  // 这个堆我们没用到，不占面板空间
+                }
+                const bool deviceLocal =
+                    (mp->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+                ImGui::Text("heap %u%s: %.2f / %.2f MB  (%u blocks, %u allocs)", i,
+                            deviceLocal ? " [dev]" : "",
+                            static_cast<double>(budgets[i].statistics.allocationBytes) /
+                                (1024.0 * 1024.0),
+                            static_cast<double>(budgets[i].statistics.blockBytes) /
+                                (1024.0 * 1024.0),
+                            budgets[i].statistics.blockCount,
+                            budgets[i].statistics.allocationCount);
+            }
+            // allocationBytes < blockBytes 的差值就是 suballocation 的内部碎片。
+            // blockCount 明显小于 allocationCount 正是 VMA 在起作用的证据：
+            // 多个资源共享同一块 VkDeviceMemory。
+            ImGui::TextDisabled("allocs < blocks = VMA suballocation");
+        }
+
         ImGui::SeparatorText("Reflected layout");
         ImGui::Text("push constant: %u bytes", program_.pushConstantSize);
         for (const auto& b : program_.bindings) {
@@ -1536,20 +1858,10 @@ void VulkanRenderer::buildUi() {
 // 底层资源辅助
 // =============================================================================
 
-uint32_t VulkanRenderer::findMemoryType(uint32_t typeBits,
-                                        VkMemoryPropertyFlags props) const {
-    VkPhysicalDeviceMemoryProperties memProps{};
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memProps);
-
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-        const bool typeOk  = (typeBits & (1u << i)) != 0;
-        const bool propsOk = (memProps.memoryTypes[i].propertyFlags & props) == props;
-        if (typeOk && propsOk) {
-            return i;
-        }
-    }
-    throw std::runtime_error("找不到满足要求的内存类型");
-}
+// findMemoryType 已删除：内存类型的挑选交给 VMA。
+// 原先那段「遍历 memoryTypes 找第一个 propertyFlags 匹配的」是教程写法，
+// 它忽略了堆大小、是否 cached、以及设备可能有多个同样满足条件但性能不同的
+// 内存类型 —— VMA 的 AUTO 会把这些都考虑进去。
 
 VkFormat VulkanRenderer::findDepthFormat() const {
     // 按偏好顺序试：优先纯深度（不带 stencil，移动端带宽更省）。
@@ -1572,25 +1884,30 @@ VkFormat VulkanRenderer::findDepthFormat() const {
 }
 
 void VulkanRenderer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                                  VkMemoryPropertyFlags props, VkBuffer& buffer,
-                                  VkDeviceMemory& memory) const {
+                                  VmaAllocationCreateFlags allocFlags, VkBuffer& buffer,
+                                  VmaAllocation& allocation) const {
     VkBufferCreateInfo info{};
     info.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     info.size        = size;
     info.usage       = usage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VK_CHECK(vkCreateBuffer(device_, &info, nullptr, &buffer));
 
-    VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(device_, buffer, &req);
+    VmaAllocationCreateInfo allocInfo{};
+    // VMA_MEMORY_USAGE_AUTO 是 VMA 3.x 推荐的用法：不再由调用方指定
+    // "要 DEVICE_LOCAL 还是 HOST_VISIBLE"，而是让 VMA 结合 usage 标志位
+    // 与设备实际的 memory heap 布局去选。
+    //
+    // 这一条在双平台上是实质收益：桌面独显有独立显存、staging 必须走
+    // HOST_VISIBLE 再拷贝；移动端是统一内存，同一块内存既 DEVICE_LOCAL
+    // 又 HOST_VISIBLE，多这一次拷贝纯属浪费。AUTO 让 VMA 各自选最优，
+    // 我们不必写 #ifdef __ANDROID__。
+    allocInfo.usage = VMA_MEMORY_USAGE_AUTO;
+    allocInfo.flags = allocFlags;
 
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize  = req.size;
-    alloc.memoryTypeIndex = findMemoryType(req.memoryTypeBits, props);
-    VK_CHECK(vkAllocateMemory(device_, &alloc, nullptr, &memory));
-
-    VK_CHECK(vkBindBufferMemory(device_, buffer, memory, 0));
+    // 一次调用完成 vkCreateBuffer + 分配 + vkBindBufferMemory。
+    // 注意 VMA 内部是 suballocation：多个 buffer 可能落在同一块
+    // VkDeviceMemory 的不同偏移上，所以绝不能对 VmaAllocation 调 vkFreeMemory。
+    VK_CHECK(vmaCreateBuffer(allocator_, &info, &allocInfo, &buffer, &allocation, nullptr));
 }
 
 VkCommandBuffer VulkanRenderer::beginOneTimeCommands() {
@@ -1613,11 +1930,15 @@ VkCommandBuffer VulkanRenderer::beginOneTimeCommands() {
 void VulkanRenderer::endOneTimeCommands(VkCommandBuffer cmd) {
     VK_CHECK(vkEndCommandBuffer(cmd));
 
-    VkSubmitInfo submit{};
-    submit.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers    = &cmd;
-    VK_CHECK(vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE));
+    VkCommandBufferSubmitInfo cmdInfo{};
+    cmdInfo.sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmdInfo.commandBuffer = cmd;
+
+    VkSubmitInfo2 submit{};
+    submit.sType                  = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos    = &cmdInfo;
+    VK_CHECK(vkQueueSubmit2(queue_, 1, &submit, VK_NULL_HANDLE));
 
     // 初始化期的一次性上传，直接等队列空闲即可。
     // 真实场景该用 fence + 传输队列异步化，但那属于资源流式加载的范畴。
@@ -1627,22 +1948,30 @@ void VulkanRenderer::endOneTimeCommands(VkCommandBuffer cmd) {
 
 void VulkanRenderer::uploadViaStaging(const void* data, VkDeviceSize size,
                                       VkBufferUsageFlags usage, VkBuffer& buffer,
-                                      VkDeviceMemory& memory) {
-    VkBuffer       staging       = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+                                      VmaAllocation& allocation) {
+    VkBuffer      staging      = VK_NULL_HANDLE;
+    VmaAllocation stagingAlloc = VK_NULL_HANDLE;
+    // HOST_ACCESS_SEQUENTIAL_WRITE 是在告诉 VMA「我只会顺序写一遍，不读」，
+    // 它据此优先挑 uncached 的 HOST_VISIBLE 内存（写合并快、不占 cache）。
+    // MAPPED_BIT 让 VMA 建完就保持映射，省掉我们自己 map/unmap。
     createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 staging, stagingMemory);
+                 VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                     VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                 staging, stagingAlloc);
 
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(device_, stagingMemory, 0, size, 0, &mapped));
-    std::memcpy(mapped, data, static_cast<size_t>(size));
-    vkUnmapMemory(device_, stagingMemory);
+    // 映射地址直接从 allocation 信息里取，不再调 vkMapMemory ——
+    // 后者对 suballocation 是错的（会映射整块大内存而不是我们那一段）。
+    VmaAllocationInfo stagingInfo{};
+    vmaGetAllocationInfo(allocator_, stagingAlloc, &stagingInfo);
+    std::memcpy(stagingInfo.pMappedData, data, static_cast<size_t>(size));
+    // 内存可能不是 HOST_COHERENT（VMA 的 AUTO 允许挑 non-coherent），
+    // 所以必须显式 flush。vmaFlushAllocation 内部会判断是否真的需要，
+    // coherent 的情况下是空操作 —— 这正是不该自己写 vkFlushMappedMemoryRanges 的原因。
+    VK_CHECK(vmaFlushAllocation(allocator_, stagingAlloc, 0, size));
 
-    // 目标缓冲放在 DEVICE_LOCAL：顶点/索引数据每帧被读很多次、写一次，
-    // 值得多做一次拷贝换取显存带宽。
-    createBuffer(size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer, memory);
+    // 目标缓冲不带 HOST_ACCESS 标志，VMA 会挑 DEVICE_LOCAL：
+    // 顶点/索引数据每帧被读很多次、只写一次，值得多做一次拷贝换带宽。
+    createBuffer(size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, buffer, allocation);
 
     VkCommandBuffer cmd = beginOneTimeCommands();
     VkBufferCopy    region{};
@@ -1650,8 +1979,8 @@ void VulkanRenderer::uploadViaStaging(const void* data, VkDeviceSize size,
     vkCmdCopyBuffer(cmd, staging, buffer, 1, &region);
     endOneTimeCommands(cmd);
 
-    vkDestroyBuffer(device_, staging, nullptr);
-    vkFreeMemory(device_, stagingMemory, nullptr);
+    // 一次调用同时销毁 buffer 与归还那段分配
+    vmaDestroyBuffer(allocator_, staging, stagingAlloc);
 }
 
 // =============================================================================
@@ -1672,18 +2001,16 @@ void VulkanRenderer::createDepthResources() {
     info.tiling        = VK_IMAGE_TILING_OPTIMAL;
     info.usage         = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(device_, &info, nullptr, &depthImage_));
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_AUTO;
+    // 深度缓冲是典型的"只有 GPU 碰、CPU 永不访问"，而且尺寸大、生命周期与
+    // swapchain 绑定。给 DEDICATED_MEMORY_BIT 让它独占一块 VkDeviceMemory：
+    // 这样 swapchain 重建时释放的是整块，不会在共享块里留下碎片。
+    // 移动端还有额外好处 —— 独立分配更容易被驱动放进 lazily-allocated 内存。
+    allocInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
 
-    VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(device_, depthImage_, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize  = req.size;
-    alloc.memoryTypeIndex = findMemoryType(req.memoryTypeBits,
-                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(device_, &alloc, nullptr, &depthMemory_));
-    VK_CHECK(vkBindImageMemory(device_, depthImage_, depthMemory_, 0));
+    VK_CHECK(vmaCreateImage(allocator_, &info, &allocInfo, &depthImage_, &depthAlloc_,
+                            nullptr));
 
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType                       = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -1695,8 +2022,14 @@ void VulkanRenderer::createDepthResources() {
     viewInfo.subresourceRange.layerCount = 1;
     VK_CHECK(vkCreateImageView(device_, &viewInfo, nullptr, &depthView_));
 
-    // 初始 layout 转换交给 renderPass 的 loadOp=CLEAR + initialLayout=UNDEFINED，
-    // 不需要额外的 barrier。
+    // 这里刻意只标 VK_IMAGE_ASPECT_DEPTH_BIT：我们只把它当深度附件用，
+    // 即使格式带 stencil 位也不需要在 view 里暴露。
+    // 注意 recordCommandBuffer 里那条 barrier 的 aspectMask 不同 ——
+    // 规范要求 barrier 对组合格式必须两位都标（见 depthAspectMask 的说明）。
+    //
+    // 不需要在这里做初始 layout 转换：每帧开头的 barrier 用
+    // oldLayout=UNDEFINED 转到 DEPTH_STENCIL_ATTACHMENT_OPTIMAL，
+    // 配合 loadOp=CLEAR 语义正确（UNDEFINED 表示丢弃原内容，本就要清）。
 }
 
 // =============================================================================
@@ -1740,9 +2073,9 @@ void VulkanRenderer::createCubeMesh() {
     }
 
     uploadViaStaging(vtxData, vtxBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertexBuffer_,
-                     vertexBufferMemory_);
+                     vertexAlloc_);
     uploadViaStaging(idxData, idxBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indexBuffer_,
-                     indexBufferMemory_);
+                     indexAlloc_);
     indexCount_ = idxCount;
     indexType_  = model_.valid() ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
 
@@ -1793,16 +2126,17 @@ void VulkanRenderer::createTexture() {
 
     const VkDeviceSize imageSize = static_cast<VkDeviceSize>(width) * height * 4;
 
-    VkBuffer       staging       = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VkBuffer      staging      = VK_NULL_HANDLE;
+    VmaAllocation stagingAlloc = VK_NULL_HANDLE;
     createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 staging, stagingMemory);
+                 VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                     VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                 staging, stagingAlloc);
 
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(device_, stagingMemory, 0, imageSize, 0, &mapped));
-    std::memcpy(mapped, pixels, static_cast<size_t>(imageSize));
-    vkUnmapMemory(device_, stagingMemory);
+    VmaAllocationInfo stagingInfo{};
+    vmaGetAllocationInfo(allocator_, stagingAlloc, &stagingInfo);
+    std::memcpy(stagingInfo.pMappedData, pixels, static_cast<size_t>(imageSize));
+    VK_CHECK(vmaFlushAllocation(allocator_, stagingAlloc, 0, imageSize));
 
     stbi_image_free(pixels);
 
@@ -1820,24 +2154,23 @@ void VulkanRenderer::createTexture() {
     imageInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
     imageInfo.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(device_, &imageInfo, nullptr, &textureImage_));
 
-    VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(device_, textureImage_, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize  = req.size;
-    alloc.memoryTypeIndex = findMemoryType(req.memoryTypeBits,
-                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(device_, &alloc, nullptr, &textureMemory_));
-    VK_CHECK(vkBindImageMemory(device_, textureImage_, textureMemory_, 0));
+    VmaAllocationCreateInfo texAlloc{};
+    texAlloc.usage = VMA_MEMORY_USAGE_AUTO;
+    // 纹理不给 DEDICATED：它尺寸相对固定、数量会随场景增长，
+    // 让 VMA 把多张贴图 suballocate 进同一块大内存才是它的主场
+    // （避免撞 maxMemoryAllocationCount，移动端常见上限 4096）。
+    //
+    // vmaCreateImage 内部会调 vkCreateImage，不要在它之前自己再建一次 ——
+    // 那样第一个 image 句柄会被覆盖掉，成为一处静默泄漏。
+    VK_CHECK(vmaCreateImage(allocator_, &imageInfo, &texAlloc, &textureImage_,
+                            &textureAlloc_, nullptr));
 
     // ---- 上传：UNDEFINED -> TRANSFER_DST -> 拷贝 -> SHADER_READ_ONLY --------
     VkCommandBuffer cmd = beginOneTimeCommands();
 
-    VkImageMemoryBarrier toTransfer{};
-    toTransfer.sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    VkImageMemoryBarrier2 toTransfer{};
+    toTransfer.sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     toTransfer.oldLayout                   = VK_IMAGE_LAYOUT_UNDEFINED;
     toTransfer.newLayout                   = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     toTransfer.srcQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
@@ -1846,11 +2179,18 @@ void VulkanRenderer::createTexture() {
     toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     toTransfer.subresourceRange.levelCount = textureMipLevels_;
     toTransfer.subresourceRange.layerCount = 1;
-    toTransfer.srcAccessMask               = 0;
-    toTransfer.dstAccessMask               = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                         &toTransfer);
+    // 这是刚创建出来的 image，没有任何在前的访问需要等待，
+    // 所以 srcStage/srcAccess 都是 NONE —— sync1 里只能写 TOP_OF_PIPE + 0。
+    toTransfer.srcStageMask  = VK_PIPELINE_STAGE_2_NONE;
+    toTransfer.srcAccessMask = VK_ACCESS_2_NONE;
+    toTransfer.dstStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+
+    VkDependencyInfo texDep{};
+    texDep.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    texDep.imageMemoryBarrierCount = 1;
+    texDep.pImageMemoryBarriers    = &toTransfer;
+    vkCmdPipelineBarrier2(cmd, &texDep);
 
     VkBufferImageCopy region{};
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1859,19 +2199,19 @@ void VulkanRenderer::createTexture() {
     vkCmdCopyBufferToImage(cmd, staging, textureImage_,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    VkImageMemoryBarrier toShader = toTransfer;
-    toShader.oldLayout            = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toShader.newLayout            = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    toShader.srcAccessMask        = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toShader.dstAccessMask        = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
-                         1, &toShader);
+    VkImageMemoryBarrier2 toShader = toTransfer;
+    toShader.oldLayout             = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toShader.newLayout             = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    toShader.srcStageMask          = VK_PIPELINE_STAGE_2_COPY_BIT;
+    toShader.srcAccessMask         = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    toShader.dstStageMask          = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    toShader.dstAccessMask         = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    texDep.pImageMemoryBarriers    = &toShader;
+    vkCmdPipelineBarrier2(cmd, &texDep);
 
     endOneTimeCommands(cmd);
 
-    vkDestroyBuffer(device_, staging, nullptr);
-    vkFreeMemory(device_, stagingMemory, nullptr);
+    vmaDestroyBuffer(allocator_, staging, stagingAlloc);
 
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType                       = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;

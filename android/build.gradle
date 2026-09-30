@@ -1,5 +1,12 @@
-// 顶层构建文件。版本组合沿用 KhronosGroup/Vulkan-Tutorial 的 Android 工程，
-// 该组合已被官方验证可用：AGP 8.11.0 + Gradle 9.5.1 + NDK 28.1 + CMake 4.0.2+。
+// 顶层构建文件。
+//
+// AGP 8.11.0 + Gradle 9.5.1 这一对沿用 KhronosGroup/Vulkan-Tutorial 的 Android
+// 工程（该组合已被官方验证可用）。但它的另两项按本机实际情况改过，不要照抄回去：
+//   NDK   官方 28.1.13356709 -> 本工程 27.3.13750724（本机只装了 23.1 / 27.3）
+//   CMake 官方 4.0.2+        -> 本工程 3.22.1（SDK Manager 标准组件，
+//                              Gradle 会自动下载；4.x 需手动装，且
+//                              Vulkan-Headers 声明的下限就是 3.22.1）
+// 具体取值在 app/build.gradle 里。
 buildscript {
     repositories {
         google()

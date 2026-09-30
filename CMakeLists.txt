@@ -59,7 +59,8 @@ foreach(_dep
         "stb/stb_image.h"
         "glm/glm/glm.hpp"
         "imgui/imgui.cpp"
-        "tinygltf/tiny_gltf_v3.c")
+        "tinygltf/tiny_gltf_v3.c"
+        "VulkanMemoryAllocator/include/vk_mem_alloc.h")
     if(NOT EXISTS "${ORIGIN_THIRD_PARTY}/${_dep}")
         message(FATAL_ERROR
             "缺少 submodule 文件: third_party/${_dep}\n"
@@ -163,6 +164,54 @@ if(MSVC)
     # 在中文 Windows 上 MSVC 默认按 GBK(936) 解读，会刷一堆 C4819。
     # 主 target 已经带了这个开关，第三方 target 得各自加。
     target_compile_options(tinygltf PRIVATE /utf-8)
+endif()
+
+# ---- VulkanMemoryAllocator ---------------------------------------------------
+# 同样自建 target。上游的 CMakeLists 这次其实挺干净（纯 INTERFACE、install 默认
+# 跟随 PROJECT_IS_TOP_LEVEL、不碰 find_package(Vulkan)），但它只提供 include 目录，
+# 而我们无论如何都要：
+#   a) 单独编一个带 VMA_IMPLEMENTATION 的 TU；
+#   b) 把下面这几个宏以 PUBLIC 方式传播出去（原因见注释）。
+# 自建更直白，也和本工程其他三方库的处理方式一致。
+add_library(vma STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/VmaImpl.cpp")
+target_include_directories(vma PUBLIC
+    "${ORIGIN_THIRD_PARTY}/VulkanMemoryAllocator/include")
+# volk 带来 Vulkan-Headers 的 include 路径
+target_link_libraries(vma PUBLIC volk::volk)
+
+# 这三个宏必须是 PUBLIC，不能用 PRIVATE。
+#
+# VMA_VULKAN_VERSION 会改变 VmaVulkanFunctions 结构体里**有哪些字段**，
+# 也就是说它影响 ABI。若实现 TU 与调用方 TU 看到的取值不同，
+# 就是一个安静的 ODR 违规 —— 编译链接都过，运行时踩内存。
+target_compile_definitions(vma PUBLIC
+    # 我们的基线是 Vulkan 1.3（见 src/VulkanRenderer.cpp 的 kRequiredApiVersion）。
+    # 必须显式钉住：VMA 默认按**头文件**能力自动探测，而 Vulkan-Headers 是
+    # 1.4.350，它会自动选 1004000，比我们实际请求的 instance 版本高一档。
+    VMA_VULKAN_VERSION=1003000
+
+    # 不引用 Vulkan 的静态函数原型。
+    # 当 VK_NO_PROTOTYPES 可见时 VMA 本来也会自动关掉它，但 VMA 直接
+    # include <vulkan/vulkan.h>（不是 volk.h），VK_NO_PROTOTYPES 是否可见
+    # 取决于 target 的传播链，不够确定。显式设 0 消除这个不确定性，
+    # 否则表现为链接期一堆 vkAllocateMemory 之类的未定义符号。
+    VMA_STATIC_VULKAN_FUNCTIONS=0
+
+    # 保持默认的 1：VMA 自己用 vkGetInstanceProcAddr / vkGetDeviceProcAddr
+    # 去取它需要的全部函数。代价是我们必须把这两个入口填进
+    # VmaVulkanFunctions（新版 VMA 里有 VMA_ASSERT 强制检查），
+    # 但比手填三十多个函数指针省太多。
+    VMA_DYNAMIC_VULKAN_FUNCTIONS=1
+)
+
+if(MSVC)
+    # /utf-8：src/VmaImpl.cpp 里有中文注释。主 target 带了这个开关，
+    # 但每个第三方 target 都要各自加一遍（tinygltf 那里同样处理）。
+    #
+    # 漏了不只是 C4819 警告那么简单：MSVC 按 GBK(936) 解读时，某些中文字符的
+    # 尾字节会把换行吞掉，导致后面的预处理指令被并到注释行里，
+    # 报出 "fatal error C1018: 意外的 #elif" 这种和真实原因完全无关的错。
+    target_compile_options(vma PRIVATE /utf-8)
 endif()
 
 # ---- stb ---------------------------------------------------------------------
@@ -317,6 +366,9 @@ set(ORIGIN_SOURCES
     src/CameraController.cpp
     src/GltfModel.cpp
 )
+# 注意 src/VmaImpl.cpp 刻意**不**列在这里：
+# 它已经是 vma target 的唯一源文件（见上面的 add_library(vma ...)）。
+# 两处都列会让 VMA_IMPLEMENTATION 展开两份，链接期一堆重复符号。
 
 if(ANDROID)
     # 目标名必须是 main：SDLActivity.getLibraries() 默认返回 {"SDL3", "main"}，
@@ -341,6 +393,7 @@ target_link_libraries(${ORIGIN_TARGET} PRIVATE
     spirv_reflect
     stb
     tinygltf
+    vma
     glm
     imgui
 )
@@ -350,7 +403,7 @@ target_link_libraries(${ORIGIN_TARGET} PRIVATE
 #
 # 用 INTERFACE_SYSTEM_INCLUDE_DIRECTORIES 而不是 add_subdirectory(... SYSTEM)：
 # 后者需要 CMake 3.25+，而 Android 侧用的是 SDK 自带的 3.22.1。
-foreach(_tp_target spdlog volk SDL3-static SDL3-shared spirv_reflect glm imgui stb tinygltf)
+foreach(_tp_target spdlog volk SDL3-static SDL3-shared spirv_reflect glm imgui stb tinygltf vma)
     if(TARGET ${_tp_target})
         get_target_property(_tp_inc ${_tp_target} INTERFACE_INCLUDE_DIRECTORIES)
         if(_tp_inc)

@@ -4,6 +4,9 @@ Vulkan 渲染骨架，**Windows + Android 双平台**，共用同一份 C++ 与�
 
 - 平台层零平台代码：`src/` 下没有任何 `android/*`、`windows.h`，也没有 `#ifdef` 平台判断
 - Vulkan 走 **C API**（volk + 原生 `vulkan_core.h`），不使用 Vulkan-Hpp
+- 基线 **Vulkan 1.3**，渲染用 **dynamic rendering**（无 `VkRenderPass` / `VkFramebuffer`）
+- 同步用 **Synchronization2**（`vkCmdPipelineBarrier2` / `vkQueueSubmit2`）
+- 显存交给 **VMA**，不写裸 `vkAllocateMemory`
 - Shader 用 **HLSL**，构建期由 **DXC** 编成 SPIR-V
 - descriptor / pipeline layout 由 **SPIRV-Reflect 反射自动生成**，shader 是布局的唯一真源
 - 窗口/输入/资源/日志统一交给 SDL3，调试面板用 **Dear ImGui**（非 docking 分支）
@@ -28,6 +31,7 @@ Origin/
 │   ├── GltfModel.*         glTF 导入（tinygltf v3，纯 CPU 侧）
 │   ├── Vertex.hpp          顶点格式（独立出来供导入器复用）
 │   ├── StbImage.cpp        stb_image 的唯一实现单元
+│   ├── VmaImpl.cpp         VMA 的唯一实现单元（VMA_IMPLEMENTATION）
 │   └── Log.hpp             VK_CHECK
 ├── shaders/                HLSL 源（cube.vs.hlsl / cube.ps.hlsl）
 ├── assets/
@@ -47,6 +51,7 @@ Origin/
 │   ├── imgui/              v1.92.9b（非 docking）
 │   ├── stb/                master（只用 stb_image.h）
 │   ├── tinygltf/           v3.0.1（纯 C 版）
+│   ├── VulkanMemoryAllocator/ v3.4.0
 │   └── spdlog/             v1.15.3
 └── android/                Android 壳（无 C++ 代码、无 Java 代码）
     ├── settings.gradle, build.gradle, gradle.properties, gradlew*
@@ -154,7 +159,7 @@ gradlew.bat installDebug
 | NDK | `27.3.13750724` |
 | CMake | `3.22.1`（SDK Manager 标准组件，Gradle 会自动下载） |
 | AGP / Gradle | `8.11.0` / `9.5.1` |
-| compileSdk / minSdk | 36 / 24 |
+| compileSdk / minSdk | 36 / **33** |
 
 只编 `arm64-v8a`。改用 SDL 源码编译后每个 ABI 都要完整编一遍 SDL3，首次构建较慢。
 
@@ -310,6 +315,227 @@ llvm-readelf --program-headers \
 `dlopen`。要改成 `liborigin.so` 就得自建一个继承 `SDLActivity` 的 Java 类并重写
 `getLibraries()`——为一个名字引入一个 Java 文件不值得，所以保留 `main`
 并在 CMakeLists 里注明了原因。
+
+## Vulkan 基线是 1.3 —— 由 dynamic rendering 决定
+
+`src/VulkanRenderer.cpp` 里的 `kRequiredApiVersion` 是全工程唯一的版本真源，
+instance / 设备过滤 / ImGui 三处都引用它。
+
+### 为什么必须是 1.3，而不是 1.1 或 1.2
+
+`vk.xml` 里 `VK_KHR_dynamic_rendering` 的声明是：
+
+```
+depends="((VK_KHR_get_physical_device_properties2,VK_VERSION_1_1)+VK_KHR_depth_stencil_resolve),VK_VERSION_1_2"
+promotedto="VK_VERSION_1_3"
+```
+
+所以理论上有三条路：核心（1.3）、1.2 + 扩展、1.1 + 一串前置扩展。
+**但后两条在 Android 上都不存在：**
+
+1. Android 平台只暴露 **1.0.3 / 1.1 / 1.3** 三档，**没有 1.2**。
+   其中 1.3 从 Android 13 / API 33 起可用，1.1 从 API 29，1.0.3 从 API 24。
+   而且不允许请求超过当前 Android 版本的上限 —— Android 12 的机器即使
+   驱动报 1.3 也拿不到。
+2. 没有「扩展兜底」这条退路。实测（跨 94 个设备/OS 组合的设备农场数据）
+   不暴露 1.3 的设备**连 `VK_KHR_dynamic_rendering` 扩展都不暴露**。
+   支持它们意味着写第二条完整的 renderpass 路径，不是加个 shim。
+
+要注意 **OS 新不等于驱动新**：Galaxy S22 跑 Android 16，
+Adreno 730 驱动仍只报 Vulkan 1.1。所以这不是「等老机器淘汰」能解决的。
+
+代价就是 `minSdk` 从 24 抬到 **33**。
+
+### 两道独立的过滤，都需要
+
+| 位置 | 过滤什么 |
+|---|---|
+| `android/app/build.gradle` 的 `minSdk 33` | **Android 版本**（1.3 从 API 33 起才暴露） |
+| Manifest 的 `vulkan.version="0x403000"` | **设备驱动能力**（Android 13 的机器也可能只有 1.1 驱动） |
+
+少了后者，Android 13 上的老 GPU 装得上但一启动就抛异常。
+`0x403000` = `VK_MAKE_VERSION(1,3,0)`，与 Android
+`PackageManager.FEATURE_VULKAN_HARDWARE_VERSION` 对 1.3 的取值一致。
+
+运行期还有第三道：`pickPhysicalDevice()` 会硬过滤掉 `apiVersion < 1.3`
+或 `dynamicRendering == false` 的设备，并按 `deviceType` 打分（独显优先）。
+日志里会逐个打出候选与被跳过的原因：
+
+```
+Vulkan loader 版本: 1.4.357
+跳过 GPU Intel(R) UHD Graphics 630：只支持 API 1.2.148，需要 1.3
+选中 GPU: NVIDIA GeForce RTX 3080 (得分 3)
+```
+
+## 从 renderpass 迁到 dynamic rendering 的四个坑
+
+都是实际踩过并修掉的。
+
+### 1. layout 转换要自己写
+
+以前 `VkAttachmentDescription` 的 `initialLayout` / `finalLayout` 让驱动在
+pass 边界免费插入转换。现在必须手写两组 barrier：
+
+```
+帧开头：颜色 UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
+        深度 UNDEFINED -> DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+帧结尾：颜色 COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
+```
+
+`oldLayout` 用 `UNDEFINED` 表示丢弃原内容，与 `loadOp = CLEAR` 一致，
+在 tile 架构上也避免把旧内容读回 tile 内存。
+帧开头那条 barrier 同时替代了原先的 `VkSubpassDependency(EXTERNAL -> 0)`，
+所以 `srcStageMask` 取 `COLOR_ATTACHMENT_OUTPUT` 而非 `TOP_OF_PIPE`
+—— 后者校验层不报错，但 swapchain image 被复用时存在写后写竞争。
+
+漏掉结尾那条的症状是 `vkQueuePresentKHR` 报 layout 不是 `PRESENT_SRC_KHR`。
+
+### 2. barrier 的 aspectMask 与 image view 的不一样
+
+深度 `VkImageView` 只标 `VK_IMAGE_ASPECT_DEPTH_BIT` 是合法的（只当深度附件用），
+但 `VkImageMemoryBarrier` 在格式同时含深度与 stencil、且 layout 是
+`DEPTH_STENCIL_ATTACHMENT_OPTIMAL` 时，**必须两位都标**
+（VUID-VkImageMemoryBarrier-image-03319）。
+
+两处不一致是正常的，不要「统一」成一个值。见 `depthAspectMask()`。
+本机选到 `D32_SFLOAT` 所以撞不上，但部分 Adreno 只给
+`D24_UNORM_S8_UINT`，那时就会报。
+
+### 3. ⚠️ ImGui 的管线也必须声明深度格式
+
+这一条最有迷惑性。ImGui 压根不读写深度，直觉上不用管，但：
+
+**管线声明的附件格式要和 `vkCmdBeginRendering` 传入的 `VkRenderingInfo`
+逐个附件对齐，与该管线是否真的使用那个附件无关。**
+
+我们的 `VkRenderingInfo` 带了 `pDepthAttachment`，于是在同一次 rendering 里
+绘制的每一条管线都得声明同样的深度格式，包括 ImGui 的：
+
+```cpp
+info.UseDynamicRendering = true;
+info.PipelineInfoMain.PipelineRenderingCreateInfo.sType =
+    VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;   // sType 不填则整个字段被忽略
+info.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+info.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &swapchainFormat_;
+info.PipelineInfoMain.PipelineRenderingCreateInfo.depthAttachmentFormat = depthFormat_;  // ← 必填
+```
+
+漏了的症状：**画面完全正常**，但校验层每帧刷
+
+```
+vkCmdDrawIndexed(): VkRenderingInfo::pDepthAttachment->imageView format
+(VK_FORMAT_D32_SFLOAT) must match ... depthAttachmentFormat (VK_FORMAT_UNDEFINED)
+```
+
+而 `vkCmdDrawIndexed` 我们自己和 ImGui 都在调，极易误判成自己的管线配错。
+
+另两个 ImGui 侧细节：`pColorAttachmentFormats` 是裸指针且 ImGui **不深拷贝**，
+必须指向生命周期长于 ImGui 的对象（这里是成员 `swapchainFormat_`）；
+`sType` 必须填对，ImGui 靠它判断这个字段有没有被设置过。
+
+真想「不声明用不到的附件」需要 `VK_EXT_dynamic_rendering_unused_attachments`，
+移动端覆盖率差，不值得为此引入。
+
+### 4. `VkRenderingInfo::layerCount` 必须 >= 1
+
+`VkFramebufferCreateInfo` 里这个字段叫 `layers`，改名后很容易漏填，
+留 0 会被校验层拦下。
+
+### 迁移后的收益
+
+- 少了 `VkRenderPass` 与 N 个 `VkFramebuffer` 两类对象；
+  swapchain 重建时不必再销毁重建 framebuffer
+- 截图路径少一次 layout 转换：
+  从 `COLOR_ATTACHMENT -> PRESENT_SRC -> TRANSFER_SRC -> PRESENT_SRC`
+  变成 `COLOR_ATTACHMENT -> TRANSFER_SRC -> PRESENT_SRC`
+- `dynamicRendering` 特性即便是 1.3 核心，**仍必须在 `vkCreateDevice` 显式启用**。
+  用 `VkPhysicalDeviceFeatures2` 挂 pNext 时 `pEnabledFeatures` 必须为 `NULL`
+  （VUID-VkDeviceCreateInfo-pNext-00373）。
+
+**深度的 `storeOp = DONT_CARE` 在 `VkRenderingAttachmentInfo` 里照样能表达**，
+迁移时务必保留 —— 这是 Mali/Adreno tile 架构上最省带宽的一处声明。
+
+## 显存管理：VMA
+
+`src/` 下没有一处裸 `vkAllocateMemory`。换掉它的理由不是"少写几行"：
+
+1. **`maxMemoryAllocationCount`**。每个资源一次 `vkAllocateMemory` 会很快撞上这个
+   上限（移动端常见 4096）。VMA 把小分配合并进大块内存做 suballocation ——
+   面板上 `Memory (VMA)` 那一行的 `blocks` 数明显小于 `allocs` 数就是它在起作用。
+2. **内存类型的选择不再手写**。原先那段「遍历 `memoryTypes` 找第一个
+   `propertyFlags` 匹配的」是教程写法，它忽略堆大小、是否 cached、以及设备可能
+   有多个同样满足条件但性能不同的内存类型。
+
+### 与 volk 对接的三个宏（都必须是 PUBLIC）
+
+```cmake
+target_compile_definitions(vma PUBLIC
+    VMA_VULKAN_VERSION=1003000
+    VMA_STATIC_VULKAN_FUNCTIONS=0
+    VMA_DYNAMIC_VULKAN_FUNCTIONS=1
+)
+```
+
+| 宏 | 为什么 |
+|---|---|
+| `VMA_VULKAN_VERSION=1003000` | **必须显式钉住**。VMA 默认按**头文件**能力自动探测，而 `Vulkan-Headers` 是 1.4.350，它会选 `1004000`，比我们请求的 instance 版本高一档 |
+| `VMA_STATIC_VULKAN_FUNCTIONS=0` | VMA 直接 `include <vulkan/vulkan.h>`（不是 `volk.h`），`VK_NO_PROTOTYPES` 是否可见取决于 target 传播链。不显式设 0 会在链接期报一堆 `vkAllocateMemory` 未定义 |
+| `VMA_DYNAMIC_VULKAN_FUNCTIONS=1` | 保持默认。代价是必须把 `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr` 填进 `VmaVulkanFunctions`（新版 VMA 有 `VMA_ASSERT` 强制检查），但比手填三十多个函数指针省得多 |
+
+⚠️ **`VMA_VULKAN_VERSION` 必须 PUBLIC，不能 PRIVATE。** 它会改变
+`VmaVulkanFunctions` 结构体里**有哪些字段**，即影响 ABI。实现 TU 与调用方 TU
+看到的取值不同就是一个安静的 ODR 违规 —— 编译链接都过，运行时踩内存。
+
+另外 `src/VmaImpl.cpp` **只能**出现在 `vma` target 的源列表里，不能同时列进主
+target，否则 `VMA_IMPLEMENTATION` 展开两份、链接期一堆重复符号。
+
+### 用法上几处刻意的选择
+
+| 资源 | flags | 理由 |
+|---|---|---|
+| staging（上传用） | `HOST_ACCESS_SEQUENTIAL_WRITE` + `MAPPED` | 只顺序写一遍不读 → VMA 挑 uncached 内存，写合并快、不占 cache |
+| 截图缓冲（下载用） | `HOST_ACCESS_RANDOM` + `MAPPED` | 是给 CPU **读**的。**方向填反是个容易犯的错** —— 用 `SEQUENTIAL_WRITE` 会挑到 uncached 内存，CPU 读它慢到离谱 |
+| 深度缓冲 | `DEDICATED_MEMORY` | 尺寸大、生命周期与 swapchain 绑定。独占一块内存，重建时释放整块不留碎片 |
+| 顶点/索引/纹理 | 无（纯 `AUTO`） | 让 VMA suballocate 进共享块，这才是它的主场 |
+
+`VMA_MEMORY_USAGE_AUTO` 在双平台上是实质收益：桌面独显有独立显存、staging 必须
+走 HOST_VISIBLE 再拷贝；移动端是统一内存，同一块既 DEVICE_LOCAL 又 HOST_VISIBLE。
+AUTO 让 VMA 各自选最优，**我们不必写 `#ifdef __ANDROID__`**。
+
+两个容易漏的 API：映射地址要从 `vmaGetAllocationInfo().pMappedData` 取，
+**不能再调 `vkMapMemory`**（那会映射整块大内存而不是我们那一段）；
+写完要 `vmaFlushAllocation`、读前要 `vmaInvalidateAllocation` ——
+AUTO 有可能挑到 non-coherent 的内存类型，漏了就读到旧数据。
+这两个函数内部会判断是否真有必要，coherent 时是空操作。
+
+顺带一个免费的收尾检查：`vmaDestroyAllocator` 时若还有未释放的 allocation，
+VMA 会在 Debug 下断言并打印泄漏清单 —— 裸 `vkFreeMemory` 时代漏了是什么都不报的。
+
+## 同步：Synchronization2
+
+`sync2` 提升到核心的版本正好是 **1.3**，所以上了 dynamic rendering 之后它是免费的
+（只需在 `VkPhysicalDeviceVulkan13Features` 里多开一个 `synchronization2`）。
+`src/` 下没有 `vkCmdPipelineBarrier` / `vkQueueSubmit` 的 sync1 调用。
+
+它不改变同步的**语义**，价值在于能表达以前表达不了的精确依赖：
+
+**1. stage 掩码是每个 barrier 独立的。** sync1 只能给整条
+`vkCmdPipelineBarrier` 一组 `src/dstStage`，所以帧开头那两个 barrier（颜色 +
+深度）被迫共享 `COLOR_ATTACHMENT_OUTPUT | EARLY_FRAGMENT_TESTS` 的**并集** ——
+等于告诉驱动「颜色附件也要等 early-Z 阶段」，是过度同步。sync2 下各自只声明
+自己真正涉及的阶段。
+
+**2. `VK_PIPELINE_STAGE_2_NONE` / `VK_ACCESS_2_NONE`。** 「没有在前的访问需要等待」
+和「没有后续访问需要等它」以前只能拿 `TOP_OF_PIPE` / `BOTTOM_OF_PIPE` 凑，
+语义上是含糊的。
+
+**3. stage 粒度更细。** `VK_PIPELINE_STAGE_2_COPY_BIT` 比 sync1 只有的
+`TRANSFER_BIT` 精确 —— 后者是 copy/blit/resolve/clear 四类的并集。
+
+**4. `vkQueueSubmit2` 去掉了平行数组。** sync1 是
+`pWaitSemaphores` + 一个靠下标对应的 `pWaitDstStageMask`，长度写错编译器发现不了；
+sync2 每个信号量自带 `stageMask`。而且**触发**阶段也能指定了 ——
+sync1 的 `pSignalSemaphores` 没有对应字段，语义等价于「整个 command buffer 跑完」。
 
 ## 平台差异的收敛方式
 

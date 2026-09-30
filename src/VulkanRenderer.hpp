@@ -7,6 +7,9 @@
 
 #include <volk.h>
 
+// VMA 的编译宏统一由 CMake 的 vma target 以 PUBLIC 传播，不在源码里 define
+#include <vk_mem_alloc.h>
+
 #include <SDL3/SDL_video.h>
 
 // GLM_FORCE_DEPTH_ZERO_TO_ONE / GLM_FORCE_RADIANS 等宏由 CMake 的 glm target
@@ -95,12 +98,10 @@ private:
     void createDevice();
     void createSwapchain();
     void createDepthResources();
-    void createRenderPass();
     void createCubeMesh();
     void createTexture();
     void createPipeline();
     void createDescriptorSet();
-    void createFramebuffers();
     void createCommandBuffers();
     void createSyncObjects();
 
@@ -119,18 +120,24 @@ private:
 
     std::vector<uint8_t> readAsset(std::string_view path);
 
-    // ---- 底层资源辅助（没有引入 VMA，先用裸 vkAllocateMemory） --------------
-    // 单个 cube 只需要 4 次分配（顶点/索引/纹理/深度），显式写出来更易读。
-    // 等资源多起来（每个 mesh 一次分配会很快撞上 maxMemoryAllocationCount）
-    // 再换 VMA 或自建 suballocator。
-    uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
+    // ---- 底层资源辅助（内存交给 VMA）----------------------------------------
+    // 换掉裸 vkAllocateMemory 的实际理由不是"少写几行"，而是：
+    //   1. 每个资源一次 vkAllocateMemory 会很快撞上 maxMemoryAllocationCount
+    //      （移动端常见 4096），VMA 会把小分配合并进大块内存里做 suballocation；
+    //   2. 内存类型的选择从"手写 propertyFlags"变成声明用途（VmaMemoryUsage），
+    //      由 VMA 按设备实际的 memory heap 布局去挑 —— 桌面独显与移动端
+    //      统一内存架构的最优选择本来就不同，手写必然要写平台分支。
+    void createAllocator();
     VkFormat findDepthFormat() const;
 
+    // 缓冲与它的 VMA 分配句柄成对出现。
+    // VmaAllocation 取代了原先的 VkDeviceMemory —— 它不是"一块显存"，
+    // 而是"某块大显存里的一段"，所以不能再对它调 vkFreeMemory。
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                      VkMemoryPropertyFlags props, VkBuffer& buffer,
-                      VkDeviceMemory& memory) const;
+                      VmaAllocationCreateFlags allocFlags, VkBuffer& buffer,
+                      VmaAllocation& allocation) const;
     void uploadViaStaging(const void* data, VkDeviceSize size, VkBufferUsageFlags usage,
-                          VkBuffer& buffer, VkDeviceMemory& memory);
+                          VkBuffer& buffer, VmaAllocation& allocation);
 
     VkCommandBuffer beginOneTimeCommands();
     void            endOneTimeCommands(VkCommandBuffer cmd);
@@ -141,6 +148,8 @@ private:
     VkInstance               instance_       = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT debugMessenger_ = VK_NULL_HANDLE;
     VkSurfaceKHR             surface_        = VK_NULL_HANDLE;
+
+    VmaAllocator allocator_ = VK_NULL_HANDLE;
 
     VkPhysicalDevice physicalDevice_   = VK_NULL_HANDLE;
     uint32_t         queueFamilyIndex_ = 0;
@@ -156,13 +165,16 @@ private:
     std::vector<VkImageView> swapchainImageViews_;
 
     // 深度缓冲跟着 swapchain 尺寸走，重建 swapchain 时必须一起重建
-    VkFormat       depthFormat_ = VK_FORMAT_UNDEFINED;
-    VkImage        depthImage_  = VK_NULL_HANDLE;
-    VkDeviceMemory depthMemory_ = VK_NULL_HANDLE;
-    VkImageView    depthView_   = VK_NULL_HANDLE;
+    VkFormat      depthFormat_ = VK_FORMAT_UNDEFINED;
+    VkImage       depthImage_  = VK_NULL_HANDLE;
+    VmaAllocation depthAlloc_  = VK_NULL_HANDLE;
+    VkImageView   depthView_   = VK_NULL_HANDLE;
 
-    VkRenderPass               renderPass_ = VK_NULL_HANDLE;
-    std::vector<VkFramebuffer> framebuffers_;
+    // 没有 VkRenderPass / VkFramebuffer 成员 —— 本工程用 dynamic rendering
+    // （Vulkan 1.3 核心）。附件在 recordCommandBuffer 里以
+    // VkRenderingAttachmentInfo 的形式逐帧描述，pipeline 只通过
+    // VkPipelineRenderingCreateInfo 记录附件**格式**。
+    // 好处之一：swapchain 重建时不再需要销毁重建 N 个 framebuffer。
 
     // pipelineLayout 与 descriptorSetLayout 都在 program_ 里，由反射生成
     Program    program_{};
@@ -170,17 +182,17 @@ private:
     ShaderStage pixelStage_{};
     VkPipeline pipeline_ = VK_NULL_HANDLE;
 
-    VkBuffer       vertexBuffer_       = VK_NULL_HANDLE;
-    VkDeviceMemory vertexBufferMemory_ = VK_NULL_HANDLE;
-    VkBuffer       indexBuffer_        = VK_NULL_HANDLE;
-    VkDeviceMemory indexBufferMemory_  = VK_NULL_HANDLE;
+    VkBuffer      vertexBuffer_ = VK_NULL_HANDLE;
+    VmaAllocation vertexAlloc_  = VK_NULL_HANDLE;
+    VkBuffer      indexBuffer_  = VK_NULL_HANDLE;
+    VmaAllocation indexAlloc_   = VK_NULL_HANDLE;
     uint32_t       indexCount_         = 0;
     // glTF 导入统一用 uint32；只有退回内置 cube 时才是 uint16
     VkIndexType    indexType_          = VK_INDEX_TYPE_UINT16;
 
-    VkImage        textureImage_  = VK_NULL_HANDLE;
-    VkDeviceMemory textureMemory_ = VK_NULL_HANDLE;
-    VkImageView    textureView_   = VK_NULL_HANDLE;
+    VkImage       textureImage_ = VK_NULL_HANDLE;
+    VmaAllocation textureAlloc_ = VK_NULL_HANDLE;
+    VkImageView   textureView_  = VK_NULL_HANDLE;
     VkSampler      textureSampler_ = VK_NULL_HANDLE;
     uint32_t       textureMipLevels_ = 1;
 
@@ -233,9 +245,9 @@ private:
     // 截图：目标缓冲跟 swapchain 尺寸绑定，重建 swapchain 时一起销毁
     std::string    screenshotPath_;
     bool           screenshotPending_ = false;
-    VkBuffer       screenshotBuffer_  = VK_NULL_HANDLE;
-    VkDeviceMemory screenshotMemory_  = VK_NULL_HANDLE;
-    VkDeviceSize   screenshotSize_    = 0;
+    VkBuffer      screenshotBuffer_ = VK_NULL_HANDLE;
+    VmaAllocation screenshotAlloc_  = VK_NULL_HANDLE;
+    VkDeviceSize  screenshotSize_   = 0;
 };
 
 }  // namespace origin

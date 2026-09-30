@@ -8,11 +8,20 @@
     android:versionName="1.0"
     android:installLocation="auto">
 
-    <!-- 声明需要 Vulkan 1.0.3。required=true 让不支持 Vulkan 的设备
-         在商店侧被过滤，避免装上去黑屏。0x400003 = VK_MAKE_VERSION(1,0,3) -->
+    <!-- 声明需要 Vulkan 1.3。required=true 让不满足的设备在商店侧被过滤，
+         避免装上去直接启动失败。
+         0x403000 = VK_MAKE_VERSION(1,3,0)，与 Android 的
+         PackageManager.FEATURE_VULKAN_HARDWARE_VERSION 对 1.3 的取值一致。
+
+         为什么要 1.3 而不是原先的 1.0.3（0x400003）：本工程用 dynamic
+         rendering，该特性在 1.3 才进核心。注意这条声明和 build.gradle 里的
+         minSdk 33 是**两道独立的过滤**，都需要：
+           minSdk    管的是 Android 版本（1.3 从 API 33 起才暴露）
+           这条声明   管的是设备驱动能力（Android 13 的机器也可能只有 1.1 驱动）
+         少了后者，Android 13 上的老 GPU 装得上但启动就抛异常。 -->
     <uses-feature
         android:name="android.hardware.vulkan.version"
-        android:version="0x400003"
+        android:version="0x403000"
         android:required="true" />
     <uses-feature
         android:name="android.hardware.vulkan.level"
@@ -30,7 +39,11 @@
         android:enableOnBackInvokedCallback="false"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
 
-        <!-- 直接使用 AAR 中的 org.libsdl.app.SDLActivity，因此本工程零 Java 文件。
+        <!-- 直接使用 org.libsdl.app.SDLActivity，因此本工程零 Java 文件。
+             该类不在本仓库里：app/build.gradle 的 sourceSets 把
+             third_party/SDL/android-project/app/src/main/java 加进了 java.srcDirs，
+             编译时从 submodule 源码取，SDL 升级自动同步。
+
              SDLActivity 继承的是 android.app.Activity，不依赖任何 androidx，
              所以既不需要 appcompat 依赖，也不受 Theme.AppCompat 主题约束。
 
