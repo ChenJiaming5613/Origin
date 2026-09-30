@@ -1,0 +1,125 @@
+# Origin 代码格式 —— 唯一真源（IDE / CI / 脚本全部读这一份）。
+#
+# 基线取官方 Microsoft 预设：4 空格缩进、120 列、指针左贴类型、Allman 大括号。
+# 然后只覆盖两处与本工程约定不符的地方（大括号的控制流分支、注释重排）。
+#
+# 为什么不是别的官方预设：
+#   LLVM / Google / Chromium  —— { 一律跟在行尾（Attach），不满足"函数体 { 换行"
+#   GNU                       —— Allman 但额外缩进大括号本身（IndentBraces），很少有人用
+#   WebKit                    —— 只有函数定义换行，但 ColumnLimit=0（不限行宽）
+#   Mozilla                   —— 大括号行为正是我们要的，但 IndentWidth=2 / ColumnLimit=80
+#                                且 AlwaysBreakAfterDefinitionReturnType=TopLevel（返回类型独占一行）
+#   Microsoft                 —— 缩进/列宽/指针对齐全中，仅 if/for 的 { 也换行，改一行即可
+#
+# 注意：clang-format 只管"排版"，完全不管"命名"。m_camelCase / CamelCase
+# 这类标识符规则没有任何 clang-format 选项能表达，由 .clang-tidy 的
+# readability-identifier-naming 负责（且它能自动重命名）。
+---
+Language: Cpp
+BasedOnStyle: Microsoft
+Standard: c++20
+
+# ---- 大括号：定义换行，控制流同行 ------------------------------------------
+# Microsoft 预设是彻底的 Allman（连 if/for 的 { 都换行）。这里保留"函数 / 类 /
+# struct / enum 定义"的换行，把控制流拉回行尾 —— 净效果等同官方 Mozilla 的
+# 大括号行为，但缩进与列宽仍沿用 Microsoft。
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterClass:            true
+  AfterStruct:           true
+  AfterUnion:            true
+  AfterEnum:             true
+  AfterFunction:         true
+  AfterNamespace:        false   # namespace origin { 保持同行，少一层视觉噪声
+  AfterExternBlock:      false
+  AfterControlStatement: Never   # if / else / for / while / switch 的 { 不换行
+  BeforeElse:            false
+  BeforeCatch:           false
+  BeforeWhile:           false
+  BeforeLambdaBody:      false   # lambda 体紧跟 ](){，换行反而把捕获和体割开
+  IndentBraces:          false
+  SplitEmptyFunction:    false   # void Tick() {} 允许压成一行
+  SplitEmptyRecord:      false
+  SplitEmptyNamespace:   false
+
+# ---- 基本排版 --------------------------------------------------------------
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+AccessModifierOffset: -4
+NamespaceIndentation: None
+IndentCaseLabels: true
+IndentPPDirectives: BeforeHash   # #if 嵌套时把 # 缩进，Vulkan 平台分支多
+FixNamespaceComments: true
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+EmptyLineBeforeAccessModifier: LogicalBlock
+SeparateDefinitionBlocks: Leave  # 不强插空行，保留手写的分组节奏
+
+# ---- 指针 / 引用 / 空格 ----------------------------------------------------
+DerivePointerAlignment: false
+PointerAlignment: Left           # VkDevice* device
+ReferenceAlignment: Left         # const glm::vec3& target
+SpaceAfterCStyleCast: false
+SpacesBeforeTrailingComments: 2  # 与工程既有的 "  // ..." 一致
+
+# ---- 对齐：沿用工程里成组对齐的手写习惯 ------------------------------------
+# Vulkan 的 VkXxxCreateInfo 结构体逐字段赋值时，成组对齐能一眼看出漏填哪个字段。
+AlignConsecutiveAssignments: Consecutive
+AlignConsecutiveDeclarations: Consecutive
+AlignConsecutiveMacros: Consecutive
+AlignAfterOpenBracket: Align
+AlignOperands: Align
+AlignEscapedNewlines: Left
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 0
+
+# ---- 注释：绝不自动重排 ----------------------------------------------------
+# 工程内注释大量为中文。clang-format 按「码点数」而非显示宽度算列宽：一个汉字
+# 占两列却只计 1，重排后实际会明显超出 120 列；更糟的是它可能在中文句子中间断行，
+# 把一句话劈成两截。所以禁用重排，换行位置由人工控制。
+ReflowComments: Never
+
+# ---- 短构造 ----------------------------------------------------------------
+AllowShortFunctionsOnASingleLine: Inline   # 类内访问器：float Distance() const { return m_distance; }
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortLambdasOnASingleLine: All
+AllowShortBlocksOnASingleLine: Empty
+InsertBraces: false              # 补大括号是语义改动，交给 clang-tidy 的 readability-braces-around-statements
+
+# ---- 换行 / 打包 ------------------------------------------------------------
+BinPackArguments: false          # 参数放不下时一行一个，长 Vulkan 调用更易读也更易 diff
+BinPackParameters: false
+Cpp11BracedListStyle: true
+BreakConstructorInitializers: BeforeColon
+PackConstructorInitializers: NextLine
+BreakStringLiterals: false       # 避免把 shader 路径 / 日志格式串切碎
+
+# ---- include 排序 ----------------------------------------------------------
+# volk.h 必须先于任何 vulkan 头：它以 VK_NO_PROTOTYPES 的方式声明全部入口，
+# 若 <vulkan/vulkan.h> 先进来就会拿到静态原型，问题要到链接期才暴露。
+# 所以显式钉成 Priority 0，不依赖字典序的巧合。
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+IncludeCategories:
+  - Regex: '^<volk\.h>$'
+    Priority: 0
+  - Regex: '^<(vulkan|vk_video)/'
+    Priority: 1
+  - Regex: '^<SDL3/'
+    Priority: 2
+  - Regex: '^<(imgui|backends/imgui)'
+    Priority: 3
+  - Regex: '^<(glm|spdlog|stb|tiny_gltf|vk_mem_alloc|spirv_reflect)'
+    Priority: 4
+  - Regex: '^<[^/]+\.h>$'        # C 标准库
+    Priority: 5
+  - Regex: '^<'                  # C++ 标准库及其余系统头
+    Priority: 6
+  - Regex: '^"'                  # 本工程头文件
+    Priority: 7
+IncludeIsMainRegex: '$'

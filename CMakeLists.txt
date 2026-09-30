@@ -185,10 +185,15 @@ target_link_libraries(vma PUBLIC volk::volk)
 # 也就是说它影响 ABI。若实现 TU 与调用方 TU 看到的取值不同，
 # 就是一个安静的 ODR 违规 —— 编译链接都过，运行时踩内存。
 target_compile_definitions(vma PUBLIC
-    # 我们的基线是 Vulkan 1.3（见 src/VulkanRenderer.cpp 的 kRequiredApiVersion）。
+    # 我们的基线是 Vulkan 1.1（见 src/VulkanRenderer.cpp 的 kRequiredApiVersion，
+    # 那里写了为什么从 1.3 退回 1.1）。
     # 必须显式钉住：VMA 默认按**头文件**能力自动探测，而 Vulkan-Headers 是
-    # 1.4.350，它会自动选 1004000，比我们实际请求的 instance 版本高一档。
-    VMA_VULKAN_VERSION=1003000
+    # 1.4.350，它会自动选 1004000 —— 比我们实际请求的 instance 版本高三档，
+    # VMA 会去调设备并未暴露的入口（如 vkGetDeviceBufferMemoryRequirements）。
+    #
+    # 1.1 仍然保留了 VMA 需要的关键能力：vkBindBufferMemory2 /
+    # vkGetBufferMemoryRequirements2（dedicated allocation 依赖它们）都是 1.1 核心。
+    VMA_VULKAN_VERSION=1001000
 
     # 不引用 Vulkan 的静态函数原型。
     # 当 VK_NO_PROTOTYPES 可见时 VMA 本来也会自动关掉它，但 VMA 直接

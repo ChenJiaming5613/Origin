@@ -4,8 +4,9 @@ Vulkan 渲染骨架，**Windows + Android 双平台**，共用同一份 C++ 与�
 
 - 平台层零平台代码：`src/` 下没有任何 `android/*`、`windows.h`，也没有 `#ifdef` 平台判断
 - Vulkan 走 **C API**（volk + 原生 `vulkan_core.h`），不使用 Vulkan-Hpp
-- 基线 **Vulkan 1.3**，渲染用 **dynamic rendering**（无 `VkRenderPass` / `VkFramebuffer`）
-- 同步用 **Synchronization2**（`vkCmdPipelineBarrier2` / `vkQueueSubmit2`）
+- 基线 **Vulkan 1.1**，渲染用传统 `VkRenderPass` + `VkFramebuffer`，同步用 sync1
+  （`vkCmdPipelineBarrier` / `vkQueueSubmit`）—— 工程一度以 1.3 + dynamic rendering
+  + Synchronization2 为基线，被真机否掉了，原因见下方「为什么基线是 1.1」
 - 显存交给 **VMA**，不写裸 `vkAllocateMemory`
 - Shader 用 **HLSL**，构建期由 **DXC** 编成 SPIR-V
 - descriptor / pipeline layout 由 **SPIRV-Reflect 反射自动生成**，shader 是布局的唯一真源
@@ -316,144 +317,265 @@ llvm-readelf --program-headers \
 `getLibraries()`——为一个名字引入一个 Java 文件不值得，所以保留 `main`
 并在 CMakeLists 里注明了原因。
 
-## Vulkan 基线是 1.3 —— 由 dynamic rendering 决定
+## 为什么基线是 1.1 —— 一次被真机否掉的决策
 
 `src/VulkanRenderer.cpp` 里的 `kRequiredApiVersion` 是全工程唯一的版本真源，
-instance / 设备过滤 / ImGui 三处都引用它。
+instance / 设备过滤 / ImGui / VMA 四处都引用它。
 
-### 为什么必须是 1.3，而不是 1.1 或 1.2
+工程曾经把它定在 **1.3**，为的是 dynamic rendering + Synchronization2。
+当时的论证是「Android 平台只暴露 1.0.3 / 1.1 / 1.3 三档，且不暴露 1.3 的设备
+连 `VK_KHR_dynamic_rendering` 扩展也没有，所以要么 1.3、要么写第二条
+renderpass 路径」——**论证本身是对的，选择错了。**
 
-`vk.xml` 里 `VK_KHR_dynamic_rendering` 的声明是：
+### 真机数据
 
-```
-depends="((VK_KHR_get_physical_device_properties2,VK_VERSION_1_1)+VK_KHR_depth_stencil_resolve),VK_VERSION_1_2"
-promotedto="VK_VERSION_1_3"
-```
+一加 Ace 竞速版（MT6895 天玑 8100 / Mali-G610 MC6）：
 
-所以理论上有三条路：核心（1.3）、1.2 + 扩展、1.1 + 一串前置扩展。
-**但后两条在 Android 上都不存在：**
-
-1. Android 平台只暴露 **1.0.3 / 1.1 / 1.3** 三档，**没有 1.2**。
-   其中 1.3 从 Android 13 / API 33 起可用，1.1 从 API 29，1.0.3 从 API 24。
-   而且不允许请求超过当前 Android 版本的上限 —— Android 12 的机器即使
-   驱动报 1.3 也拿不到。
-2. 没有「扩展兜底」这条退路。实测（跨 94 个设备/OS 组合的设备农场数据）
-   不暴露 1.3 的设备**连 `VK_KHR_dynamic_rendering` 扩展都不暴露**。
-   支持它们意味着写第二条完整的 renderpass 路径，不是加个 shim。
-
-要注意 **OS 新不等于驱动新**：Galaxy S22 跑 Android 16，
-Adreno 730 驱动仍只报 Vulkan 1.1。所以这不是「等老机器淘汰」能解决的。
-
-代价就是 `minSdk` 从 24 抬到 **33**。
-
-### 两道独立的过滤，都需要
-
-| 位置 | 过滤什么 |
+| 项目 | 值 |
 |---|---|
-| `android/app/build.gradle` 的 `minSdk 33` | **Android 版本**（1.3 从 API 33 起才暴露） |
-| Manifest 的 `vulkan.version="0x403000"` | **设备驱动能力**（Android 13 的机器也可能只有 1.1 驱动） |
+| Android 版本 | **15**（API 35） |
+| `pm list features` 的 `vulkan.version` | `4198400` = `0x401000` = **1.1** |
+| `VkPhysicalDeviceProperties.apiVersion` | **1.1.177** |
+| `driverVersion` | `32.1.0`（`0x08001000`）= ARM Mali **r32p1，2021 年** |
+| `VK_KHR_dynamic_rendering` | **false** |
+| `VK_KHR_synchronization2` | **false** |
 
-少了后者，Android 13 上的老 GPU 装得上但一启动就抛异常。
-`0x403000` = `VK_MAKE_VERSION(1,3,0)`，与 Android
-`PackageManager.FEATURE_VULKAN_HARDWARE_VERSION` 对 1.3 的取值一致。
+注意第二行和第一行的矛盾：**系统是 Android 15，Vulkan 却只有 1.1**。
+这直接推翻了「`minSdk 33` ⇒ 设备支持 1.3」这个隐含假设 ——
+Android CDD 对 Vulkan 1.3 的强制只针对 **Android 14 起新上市**的机型，
+存量机器升级大版本系统不受约束。厂商把系统升到了 15，却没换 GPU 驱动 blob。
 
-运行期还有第三道：`pickPhysicalDevice()` 会硬过滤掉 `apiVersion < 1.3`
-或 `dynamicRendering == false` 的设备，并按 `deviceType` 打分（独显优先）。
-日志里会逐个打出候选与被跳过的原因：
+（README 的旧版本其实已经写了「OS 新不等于驱动新」并举了 Galaxy S22 的例子，
+只是当时没把这个警告贯彻到结论里。）
+
+### 为什么连扩展都没有：看时间线
+
+| 扩展 | 发布 | 核心化 |
+|---|---|---|
+| `VK_EXT_descriptor_indexing` | 2019 | 1.2 |
+| `VK_KHR_buffer_device_address` | 2020 | 1.2 |
+| `VK_KHR_synchronization2` | 2021-02（spec 1.2.170） | 1.3 |
+| `VK_KHR_dynamic_rendering` | **2021-11-15**（spec 1.2.197） | 1.3 |
+
+驱动的 header patch 号是 **177**，正好卡在 sync2 与 dynamic rendering 之间，
+比后者的发布日还早 —— 驱动里不可能有它。
+
+### 翻转决策的关键：这台设备的 bindless 与 GPU-driven 能力是**齐全**的
+
+| 能力 | Mali-G610 r32p1 | Intel UHD 630 | RTX 3080 |
+|---|---|---|---|
+| API / 扩展数 | 1.1.177 / 71 | 1.2.148 / 74 | 1.4.341 / 276 |
+| dynamicRendering / sync2 | ✗ / ✗ | ✗ / ✗ | ✓ / ✓ |
+| runtimeDescriptorArray | **✓** | ✓ | ✓ |
+| nonUniformIndexing（sampled/storageBuf/storageImg） | **✓✓✓** | ✓✓✗ | ✓✓✓ |
+| updateAfterBind | **✓✓✓** | ✓✓✓ | ✓✓✓ |
+| maxUpdateAfterBind sampledImages | **500000** | 1048576 | 1048576 |
+| bufferDeviceAddress | **✓** | ✓ | ✓ |
+| multiDrawIndirect / maxDrawIndirectCount | **✓ / 2³²-1** | ✓ / 2³²-1 | ✓ / 2³²-1 |
+| drawIndirectCount / shaderDrawParameters | **✓ / ✓** | ✓ / ✓ | ✓ / ✓ |
+| descriptorBuffer(EXT) / meshShader(EXT) | ✗ / ✗ | ✗ / ✗ | ✓ / ✓ |
+
+dynamic rendering 和 synchronization2 **都只是写法现代化，不提供任何新的 GPU 能力**。
+而这台设备做 bindless + GPU-driven 所需的一切都在。
+用几百行 renderpass 样板换一台能跑真机实验的设备 —— 这笔交易是划算的。
+
+Intel UHD 630 是第二个例证：1.2.148、没有 dynamic rendering，但 bindless 全绿。
+**结论：bindless / GPU-driven 的能力不随 `apiVersion` 走，必须逐台查特性位。**
+
+### 能力报告
+
+`pickPhysicalDevice()` 对**每个**候选设备无条件打印一份完整能力报告，
+且放在硬过滤**之前** —— 被跳过的那台差在哪，恰恰是最需要知道的信息：
 
 ```
-Vulkan loader 版本: 1.4.357
-跳过 GPU Intel(R) UHD Graphics 630：只支持 API 1.2.148，需要 1.3
-选中 GPU: NVIDIA GeForce RTX 3080 (得分 3)
+── GPU: Mali-G610 MC6 ─────────────────────────────
+   API 1.1.177 | driver 32.1.0 (0x08001000) | vendor 0x13B5 | 类型 1 | 71 个扩展
+   [基线] dynamicRendering=false sync2=false  (扩展: dynamic_rendering=false sync2=false)
+   [bindless] runtimeDescriptorArray=true partiallyBound=true variableCount=true
+   [bindless] maxUpdateAfterBind: sampledImages=500000 storageBuffers=500000
+   [bindless] bufferDeviceAddress=true (扩展=true) | descriptorBuffer=false (扩展=false)
+   [GPU-driven] multiDrawIndirect=true firstInstance=true maxDrawIndirectCount=4294967295
+   [GPU-driven] drawIndirectCount=true shaderDrawParameters=true
 ```
 
-## 从 renderpass 迁到 dynamic rendering 的四个坑
+查询时有个细节容易错：必须用**扩展版**结构体
+（`VkPhysicalDeviceDynamicRenderingFeaturesKHR` 等），
+不能用 `VkPhysicalDeviceVulkan13Features` —— 后者在低版本设备上会被驱动
+整体忽略、字段全留 0，于是无法区分「不支持」和「没查到」。
 
-都是实际踩过并修掉的。
+### 在 1.1 基线下用 1.2 才核心化的特性
 
-### 1. layout 转换要自己写
+降到 1.1 **不会**挡住 bindless 与 GPU-driven —— 那些特性都有扩展形式，
+而且依赖天然满足。`vk.xml` 的声明（`+` 是 AND，`,` 是 **OR**）：
 
-以前 `VkAttachmentDescription` 的 `initialLayout` / `finalLayout` 让驱动在
-pass 边界免费插入转换。现在必须手写两组 barrier：
+| 扩展 | `depends` | `promotedto` |
+|---|---|---|
+| `VK_EXT_descriptor_indexing` | `(VK_KHR_get_physical_device_properties2+VK_KHR_maintenance3)`**`,VK_VERSION_1_1`** | 1.2 |
+| `VK_KHR_buffer_device_address` | `(VK_KHR_get_physical_device_properties2+VK_KHR_device_group)`**`,VK_VERSION_1_1`** | 1.2 |
+| `VK_KHR_draw_indirect_count` | （无） | 1.2 |
+| `VK_KHR_shader_draw_parameters` | （无） | **1.1**（已在核心） |
+
+关键在加粗的那半边：**`VK_VERSION_1_1` 单独就满足依赖**，因为前置的
+`get_physical_device_properties2` / `maintenance3` / `device_group` 都已在 1.1
+核心化。所以在 1.1 上只需把扩展名塞进 `ppEnabledExtensionNames`，
+不必逐个启用前置扩展（在 1.0 上就必须了）。
+
+#### 三个必须做对的点
+
+**1. 用带后缀的入口，不能用 1.2 的核心名。**
+`VkApplicationInfo::apiVersion` 是 1.1，所以 `vkGetBufferDeviceAddress`（1.2 核心）
+不可用 —— 校验层会拦，volk 也不会为它填函数指针。必须用
+`vkGetBufferDeviceAddressKHR`。这一点**在所有设备上一致**，包括报 1.4 的
+RTX 3080：instance 请求的是 1.1，设备再新也只能走扩展入口。
+所以仍然是单一代码路径，没有分叉。
+
+**2. 特性结构体也要用扩展版。**
+用 `VkPhysicalDeviceDescriptorIndexingFeatures` /
+`VkPhysicalDeviceBufferDeviceAddressFeatures`，**不能**用
+`VkPhysicalDeviceVulkan12Features` —— 后者要求 apiVersion ≥ 1.2，
+在 1.1 的 device 上会被驱动整体忽略，于是「以为开了其实没开」。
+同理，查询时用它也无法区分「不支持」和「没查到」（字段全留 0）。
+
+**3. VMA 要被告知。**
+启用 `bufferDeviceAddress` 后必须给 allocator 加
+`VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT`，否则 VMA 分配内存时不会挂
+`VkMemoryAllocateFlagsInfo{VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT}`，
+带 `SHADER_DEVICE_ADDRESS` usage 的 buffer 绑上去会被校验层拦下
+（VUID-vkBindBufferMemory-bufferDeviceAddress-03339）。
+
+这里有个容易误判的地方：VMA 的 `VMA_BUFFER_DEVICE_ADDRESS` 宏条件是
+`VK_KHR_buffer_device_address || VMA_VULKAN_VERSION >= 1002000`，
+前者是 Vulkan 头文件里的扩展宏（恒为 1）—— 所以即便把 `VMA_VULKAN_VERSION`
+钉在 `1001000`，这条功能**仍然编进来了**，不需要额外 `define`。
+VMA 自己也不调 `vkGetBufferDeviceAddress`（取地址是应用的事），
+它只负责分配时加那个 flag。
+
+另外 `SHADER_DEVICE_ADDRESS` 这位 usage 只能在 `vkCreateBuffer` 时定、事后改不了，
+所以顶点/索引缓冲在能取地址时就带上了 —— 等 GPU-driven 路径真要按指针读顶点时
+不必重建 buffer。
+
+#### 端到端验证
+
+工程在 `createCubeMesh` 末尾跑了一次完整链路验证，任何一环漏了都会暴露：
 
 ```
-帧开头：颜色 UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
-        深度 UNDEFINED -> DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-帧结尾：颜色 COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
+可选能力: descriptorIndexing=true bufferDeviceAddress=true
+已启用 device 扩展: VK_KHR_swapchain
+已启用 device 扩展: VK_EXT_descriptor_indexing
+已启用 device 扩展: VK_KHR_buffer_device_address
+bufferDeviceAddress 验证通过: vertex=0x000000000F7C0000 index=0x000000000F831B80
 ```
 
-`oldLayout` 用 `UNDEFINED` 表示丢弃原内容，与 `loadOp = CLEAR` 一致，
+RTX 3080 上校验层零报错 —— 证明「1.1 instance + 1.2 扩展」这条路完全合法。
+
+`caps_` 只在 `pickPhysicalDevice` 探测一次，判定要求**扩展存在 AND 特性位为 true**：
+扩展被列出只代表入口可用，具体子特性仍可能报 false。
+
+### Manifest 的 feature 声明只管商店，不管 adb
+
+`vulkan.version="0x401000"`（= 1.1）只在应用商店侧过滤设备，
+**`adb install` 完全不受它约束**。当初声明 1.3 的那版照样装上了这台 1.1 的机器，
+只是启动时才在 `pickPhysicalDevice()` 里失败。所以它不能替代运行期检查。
+
+## renderpass 路径：结构与回退时的代价
+
+### 对象与生命周期
+
+| 对象 | 依赖 | 何时重建 |
+|---|---|---|
+| `renderPass_` | 只依赖附件**格式**（颜色 + 深度） | 只建一次，跨 swapchain 重建存活 |
+| `pipeline_` | 只依赖 `renderPass_` 的**兼容性**（附件数量/格式/采样数） | 只建一次 |
+| `framebuffers_` | 具体的 image view + 尺寸 | **每次 swapchain 重建都要重建** |
+
+最后一行就是 dynamic rendering 想省掉的那部分样板。好在 `renderPass` 与
+`pipeline` 都能复用 —— 转屏时不必重新编译 shader，这是避免卡顿的关键。
+
+### 便利：layout 转换免费
+
+附件的 `initialLayout` / `finalLayout` 写在 `VkAttachmentDescription` 里，
+驱动在 pass 边界自动插入转换，`recordCommandBuffer` 里**一条 barrier 都不用写**：
+
+```
+颜色：UNDEFINED -> (pass 内 COLOR_ATTACHMENT_OPTIMAL) -> PRESENT_SRC_KHR
+深度：UNDEFINED -> DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+```
+
+`initialLayout` 用 `UNDEFINED` 表示丢弃原内容，与 `loadOp = CLEAR` 一致，
 在 tile 架构上也避免把旧内容读回 tile 内存。
-帧开头那条 barrier 同时替代了原先的 `VkSubpassDependency(EXTERNAL -> 0)`，
-所以 `srcStageMask` 取 `COLOR_ATTACHMENT_OUTPUT` 而非 `TOP_OF_PIPE`
-—— 后者校验层不报错，但 swapchain image 被复用时存在写后写竞争。
+写成 `PRESENT_SRC_KHR`（想当然地「上一帧结束时它就是这个 layout」）是常见错误 ——
+那会让驱动以为需要保留内容，白白多一次 tile load。
 
-漏掉结尾那条的症状是 `vkQueuePresentKHR` 报 layout 不是 `PRESENT_SRC_KHR`。
+跨帧排序由 `VkSubpassDependency(EXTERNAL -> 0)` 负责，`srcStageMask` 取
+`COLOR_ATTACHMENT_OUTPUT` 而非 `TOP_OF_PIPE` —— 后者校验层不报错，
+但 swapchain image 被复用时存在写后写竞争。
 
-### 2. barrier 的 aspectMask 与 image view 的不一样
+深度的 `storeOp = DONT_CARE` 务必保留：深度值出了本 pass 没人再读，
+Mali/Adreno 据此完全跳过「把 tile 内深度写回主存」，是移动端最省带宽的一处声明。
+
+### 代价一：sync1 无法表达每 barrier 独立的 stage
+
+`VkSubpassDependency` 只有**一组** `src/dstStageMask`，颜色与深度被迫共享
+`COLOR_ATTACHMENT_OUTPUT | EARLY_FRAGMENT_TESTS` 的并集 ——
+等于告诉驱动「颜色附件也要等 early-Z 阶段」，属于过度同步。
+sync2 的 `VkImageMemoryBarrier2` 可以让两个 barrier 各自只声明自己的阶段。
+
+同类精度损失还有三处：
+
+| sync2 能写 | sync1 只能写 |
+|---|---|
+| `PIPELINE_STAGE_2_NONE` / `ACCESS_2_NONE`（无在前/后续访问） | `TOP_OF_PIPE` / `BOTTOM_OF_PIPE` + mask 0 |
+| `PIPELINE_STAGE_2_COPY_BIT` | `TRANSFER_BIT`（copy/blit/resolve/clear 的并集） |
+| `VkSemaphoreSubmitInfo` 里信号量自带 `stageMask`，**触发**阶段也可指定 | `pWaitSemaphores` + 靠下标对应的平行数组 `pWaitDstStageMask`；`pSignalSemaphores` 无阶段字段，语义固定为「整个 command buffer 跑完」 |
+
+实际影响都很小（驱动多半会自己优化掉），但这是真实的表达力损失，不是等价替换。
+
+### 代价二：截图多一次 layout 转换
+
+render pass 的 `finalLayout` 已经把 image 转成 `PRESENT_SRC_KHR`，要读它必须
+`PRESENT_SRC -> TRANSFER_SRC -> PRESENT_SRC`；dynamic rendering 路径能插在
+`COLOR_ATTACHMENT -> PRESENT_SRC` 中间，只需两次。只在截图帧发生，可以接受。
+
+copy 命令仍然刻意并入**当帧**的 command buffer：此刻这张 swapchain image 是本帧
+acquire 到的、由本 command buffer 合法持有。若在 present 之后另起 command buffer
+去转换，校验层会报 `performs a layout transition on presentable image ... has not been acquired`。
+
+### 代价三：`clearValues` 的下标耦合
+
+`VkRenderPassBeginInfo::pClearValues` 的下标必须与 `pAttachments` 一一对应
+（0 颜色、1 深度）。dynamic rendering 下 `clearValue` 直接挂在各自的
+`VkRenderingAttachmentInfo` 上，不会错位。
+
+### 回退后消失的一个坑：ImGui 不再需要声明深度格式
+
+dynamic rendering 路径下这一条极有迷惑性 —— ImGui 压根不读写深度，
+但**管线声明的附件格式要和 `VkRenderingInfo` 逐个附件对齐，与该管线是否真的
+使用那个附件无关**。漏填 `depthAttachmentFormat` 的症状是画面完全正常、
+校验层每帧刷 format mismatch，而 `vkCmdDrawIndexed` 我们自己和 ImGui 都在调，
+极易误判成自己的管线配错。
+
+render pass 的兼容性判定以 `renderPass` 对象为准，不存在这个问题：
+
+```cpp
+info.UseDynamicRendering          = false;
+info.PipelineInfoMain.RenderPass  = renderPass_;
+info.PipelineInfoMain.Subpass     = 0;
+info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+```
+
+⚠️ ImGui 在 **2025/09/26** 之后把 `RenderPass` / `Subpass` / `MSAASamples`
+从 `InitInfo` 顶层挪进了 `PipelineInfoMain`。照老教程写 `info.RenderPass`
+在 v1.92 上**根本编不过** —— 这是回退时最容易被旧资料带偏的一处。
+
+### 仍然有效的一条：barrier 的 aspectMask 与 image view 不一样
 
 深度 `VkImageView` 只标 `VK_IMAGE_ASPECT_DEPTH_BIT` 是合法的（只当深度附件用），
 但 `VkImageMemoryBarrier` 在格式同时含深度与 stencil、且 layout 是
 `DEPTH_STENCIL_ATTACHMENT_OPTIMAL` 时，**必须两位都标**
-（VUID-VkImageMemoryBarrier-image-03319）。
+（VUID-VkImageMemoryBarrier-image-03319）。两处不一致是正常的，不要「统一」。
 
-两处不一致是正常的，不要「统一」成一个值。见 `depthAspectMask()`。
-本机选到 `D32_SFLOAT` 所以撞不上，但部分 Adreno 只给
-`D24_UNORM_S8_UINT`，那时就会报。
-
-### 3. ⚠️ ImGui 的管线也必须声明深度格式
-
-这一条最有迷惑性。ImGui 压根不读写深度，直觉上不用管，但：
-
-**管线声明的附件格式要和 `vkCmdBeginRendering` 传入的 `VkRenderingInfo`
-逐个附件对齐，与该管线是否真的使用那个附件无关。**
-
-我们的 `VkRenderingInfo` 带了 `pDepthAttachment`，于是在同一次 rendering 里
-绘制的每一条管线都得声明同样的深度格式，包括 ImGui 的：
-
-```cpp
-info.UseDynamicRendering = true;
-info.PipelineInfoMain.PipelineRenderingCreateInfo.sType =
-    VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;   // sType 不填则整个字段被忽略
-info.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
-info.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &swapchainFormat_;
-info.PipelineInfoMain.PipelineRenderingCreateInfo.depthAttachmentFormat = depthFormat_;  // ← 必填
-```
-
-漏了的症状：**画面完全正常**，但校验层每帧刷
-
-```
-vkCmdDrawIndexed(): VkRenderingInfo::pDepthAttachment->imageView format
-(VK_FORMAT_D32_SFLOAT) must match ... depthAttachmentFormat (VK_FORMAT_UNDEFINED)
-```
-
-而 `vkCmdDrawIndexed` 我们自己和 ImGui 都在调，极易误判成自己的管线配错。
-
-另两个 ImGui 侧细节：`pColorAttachmentFormats` 是裸指针且 ImGui **不深拷贝**，
-必须指向生命周期长于 ImGui 的对象（这里是成员 `swapchainFormat_`）；
-`sType` 必须填对，ImGui 靠它判断这个字段有没有被设置过。
-
-真想「不声明用不到的附件」需要 `VK_EXT_dynamic_rendering_unused_attachments`，
-移动端覆盖率差，不值得为此引入。
-
-### 4. `VkRenderingInfo::layerCount` 必须 >= 1
-
-`VkFramebufferCreateInfo` 里这个字段叫 `layers`，改名后很容易漏填，
-留 0 会被校验层拦下。
-
-### 迁移后的收益
-
-- 少了 `VkRenderPass` 与 N 个 `VkFramebuffer` 两类对象；
-  swapchain 重建时不必再销毁重建 framebuffer
-- 截图路径少一次 layout 转换：
-  从 `COLOR_ATTACHMENT -> PRESENT_SRC -> TRANSFER_SRC -> PRESENT_SRC`
-  变成 `COLOR_ATTACHMENT -> TRANSFER_SRC -> PRESENT_SRC`
-- `dynamicRendering` 特性即便是 1.3 核心，**仍必须在 `vkCreateDevice` 显式启用**。
-  用 `VkPhysicalDeviceFeatures2` 挂 pNext 时 `pEnabledFeatures` 必须为 `NULL`
-  （VUID-VkDeviceCreateInfo-pNext-00373）。
-
-**深度的 `storeOp = DONT_CARE` 在 `VkRenderingAttachmentInfo` 里照样能表达**，
-迁移时务必保留 —— 这是 Mali/Adreno tile 架构上最省带宽的一处声明。
+回到 render pass 后每帧的深度转换由 render pass 处理，所以 `depthAspectMask()`
+目前没有调用点（标了 `[[maybe_unused]]`）。刻意保留：一旦加阴影图、后处理等
+需要手动转换深度 layout 的路径就会立刻用上，而这条 VUID 极易踩。
 
 ## 显存管理：VMA
 
@@ -470,7 +592,7 @@ vkCmdDrawIndexed(): VkRenderingInfo::pDepthAttachment->imageView format
 
 ```cmake
 target_compile_definitions(vma PUBLIC
-    VMA_VULKAN_VERSION=1003000
+    VMA_VULKAN_VERSION=1001000
     VMA_STATIC_VULKAN_FUNCTIONS=0
     VMA_DYNAMIC_VULKAN_FUNCTIONS=1
 )
@@ -478,7 +600,7 @@ target_compile_definitions(vma PUBLIC
 
 | 宏 | 为什么 |
 |---|---|
-| `VMA_VULKAN_VERSION=1003000` | **必须显式钉住**。VMA 默认按**头文件**能力自动探测，而 `Vulkan-Headers` 是 1.4.350，它会选 `1004000`，比我们请求的 instance 版本高一档 |
+| `VMA_VULKAN_VERSION=1001000` | **必须显式钉住**，且要跟 `kRequiredApiVersion` 一致。VMA 默认按**头文件**能力自动探测，而 `Vulkan-Headers` 是 1.4.350，它会选 `1004000` —— 比我们请求的 instance 版本高三档，VMA 会去调设备并未暴露的入口。1.1 仍保留了 VMA 需要的 `vkBindBufferMemory2` / `vkGetBufferMemoryRequirements2`（dedicated allocation 依赖它们，都是 1.1 核心） |
 | `VMA_STATIC_VULKAN_FUNCTIONS=0` | VMA 直接 `include <vulkan/vulkan.h>`（不是 `volk.h`），`VK_NO_PROTOTYPES` 是否可见取决于 target 传播链。不显式设 0 会在链接期报一堆 `vkAllocateMemory` 未定义 |
 | `VMA_DYNAMIC_VULKAN_FUNCTIONS=1` | 保持默认。代价是必须把 `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr` 填进 `VmaVulkanFunctions`（新版 VMA 有 `VMA_ASSERT` 强制检查），但比手填三十多个函数指针省得多 |
 
@@ -511,31 +633,21 @@ AUTO 有可能挑到 non-coherent 的内存类型，漏了就读到旧数据。
 顺带一个免费的收尾检查：`vmaDestroyAllocator` 时若还有未释放的 allocation，
 VMA 会在 Debug 下断言并打印泄漏清单 —— 裸 `vkFreeMemory` 时代漏了是什么都不报的。
 
-## 同步：Synchronization2
+## 同步：sync1（以及为什么不是 Synchronization2）
 
-`sync2` 提升到核心的版本正好是 **1.3**，所以上了 dynamic rendering 之后它是免费的
-（只需在 `VkPhysicalDeviceVulkan13Features` 里多开一个 `synchronization2`）。
-`src/` 下没有 `vkCmdPipelineBarrier` / `vkQueueSubmit` 的 sync1 调用。
+`synchronization2` 提升到核心的版本是 **1.3**，和 dynamic rendering 一起被
+Vulkan 1.1 的基线挡在门外，而且这台真机连 `VK_KHR_synchronization2` 扩展也没有。
+所以 `src/` 下用的是 `vkCmdPipelineBarrier` / `vkQueueSubmit`。
 
-它不改变同步的**语义**，价值在于能表达以前表达不了的精确依赖：
+工程曾经全面用过 sync2，具体的表达力差距列在上面
+「renderpass 路径：结构与回退时的代价」的代价一那一节。简单说：sync2 不改变
+同步的**语义**，只是能更精确地表达依赖（每 barrier 独立 stage、`NONE` 语义、
+`COPY_BIT` 细分、信号量自带 stage），所以退回 sync1 是能力上的无损、
+表达精度上的有损。
 
-**1. stage 掩码是每个 barrier 独立的。** sync1 只能给整条
-`vkCmdPipelineBarrier` 一组 `src/dstStage`，所以帧开头那两个 barrier（颜色 +
-深度）被迫共享 `COLOR_ATTACHMENT_OUTPUT | EARLY_FRAGMENT_TESTS` 的**并集** ——
-等于告诉驱动「颜色附件也要等 early-Z 阶段」，是过度同步。sync2 下各自只声明
-自己真正涉及的阶段。
-
-**2. `VK_PIPELINE_STAGE_2_NONE` / `VK_ACCESS_2_NONE`。** 「没有在前的访问需要等待」
-和「没有后续访问需要等它」以前只能拿 `TOP_OF_PIPE` / `BOTTOM_OF_PIPE` 凑，
-语义上是含糊的。
-
-**3. stage 粒度更细。** `VK_PIPELINE_STAGE_2_COPY_BIT` 比 sync1 只有的
-`TRANSFER_BIT` 精确 —— 后者是 copy/blit/resolve/clear 四类的并集。
-
-**4. `vkQueueSubmit2` 去掉了平行数组。** sync1 是
-`pWaitSemaphores` + 一个靠下标对应的 `pWaitDstStageMask`，长度写错编译器发现不了；
-sync2 每个信号量自带 `stageMask`。而且**触发**阶段也能指定了 ——
-sync1 的 `pSignalSemaphores` 没有对应字段，语义等价于「整个 command buffer 跑完」。
+将来如果测试设备换成有 `VK_KHR_synchronization2` 的机器，可以只把这一层升回去
+（sync2 有扩展形式，不强制要 1.3 核心）—— barrier 与 submit 是局部改动，
+不像 render pass 那样牵动 pipeline 与 ImGui 初始化。
 
 ## 平台差异的收敛方式
 
@@ -606,12 +718,27 @@ configure 必然早于任何打包任务。（build 阶段的增量重编也保�
 
 ## 下一步
 
-1. 接 tinygltf：`git submodule add https://github.com/syoyo/tinygltf.git third_party/tinygltf`，
-   `readAsset` 已是字节流接口，直接 `LoadBinaryFromMemory`，
-   不需要 `TINYGLTF_ANDROID_LOAD_FROM_ASSETS`
-2. 升级 Synchronization2 + Dynamic Rendering（两者都有 KHR 扩展形式，
-   不必抬高 Vulkan 基线），趁代码规模小时改成本最低
-3. 顶点/索引缓冲 + VMA
+按「能在手头真机上跑」排序 —— 测试机的能力报告见前文，bindless 与 GPU-driven
+所需的特性位全绿，这两条都不需要换设备：
+
+**地基已就位**：`VK_EXT_descriptor_indexing` 与 `VK_KHR_buffer_device_address`
+已经在 `createDevice` 里按 `caps_` 条件启用并通过端到端验证（见上一节），
+顶点/索引缓冲也已带上 `SHADER_DEVICE_ADDRESS` usage。剩下的是使用侧：
+
+1. **bindless 材质**：把 baseColor 贴图收成一个大数组，材质下标走 push constant
+   / instance 数据，shader 侧用 `NonUniformResourceIndex()`。
+   当前 `recordCommandBuffer` 里每个 primitive 都重 push 一次 MVP 的写法，
+   正是它要替掉的东西。
+   待办：descriptor set layout 改成 variable-count 数组（`ShaderReflect` 的
+   反射生成要相应支持）、给 HLSL 编译加 `-fspv-target-env=vulkan1.1`
+   （`NonUniformResourceIndex` 需要 `SPV_EXT_descriptor_indexing`）。
+2. **GPU-driven draw**：`multiDrawIndirect` + `VK_KHR_draw_indirect_count`
+   （让 draw 数量本身来自 GPU buffer，该扩展无依赖、1.1 直接可用）
+   + `shaderDrawParameters` 的 `gl_DrawID`（已在 1.1 核心）。
+   配合 compute shader 做视锥剔除，就是 SIGGRAPH 2015 那套的最小可运行版本。
+3. **pipeline cache** 落盘：移动端 pipeline 创建要编译 shader，冷启动开销明显。
+4. 有条件时把 **sync2 升回去**（有 KHR 扩展形式，不必抬 Vulkan 基线），
+   barrier 与 submit 是局部改动。dynamic rendering 则要等设备支持。
 
 ---
 

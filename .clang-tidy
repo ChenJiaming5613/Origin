@@ -1,0 +1,162 @@
+# Origin 静态检查 + 命名规范 —— 唯一真源。
+#
+# 命名部分（readability-identifier-naming）是本文件的重点：
+# clang-format 只排版，完全不管标识符拼写；m_camelCase / CamelCase 这类规则
+# 只能在这里表达。且这条 check 自带 fixit，能一键批量重命名（含所有引用处）。
+#
+# 约定的目标风格 —— 等价于 CryEngine / O3DE 一脉的写法：
+#   类型         CamelCase          class VulkanRenderer / struct Vertex / enum class QueueKind
+#   函数、方法   CamelCase          void DrawFrame(); glm::mat4 ViewProj() const;
+#   private/protected 成员  m_camelCase   VkDevice m_device; float m_distance;
+#   public 成员（POD）      camelCase     struct Vertex { glm::vec3 pos; }
+#   局部变量、参数          camelCase     uint32_t imageIndex
+#   常量（全局/静态/constexpr）  kCamelCase   kRequiredApiVersion
+#   命名空间     lower_case         namespace origin
+#   宏           UPPER_CASE
+#
+# 为什么 public 成员不带 m_：m_ 的作用是在成员函数体里区分「成员 vs 局部」，
+# 而 public 数据成员基本只出现在 POD 聚合体里（Vertex、PushConstants、
+# VkXxx 的镜像结构），那里带前缀只会让「字段名 ↔ shader 里的字段名」对不上。
+# 若你想让 public 成员也带 m_，把下面 PublicMemberPrefix 一行取消注释即可。
+
+---
+# ---- 启用的检查 ------------------------------------------------------------
+# 先全关再逐组打开，避免 clang-tidy 升级时突然冒出几百条新告警。
+# 关掉的每一条后面都写了原因 —— 都是在 Vulkan/C API 代码里必然大量误报的。
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  readability-*,
+  misc-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-invalid-enum-default-initialization,
+  -readability-use-concise-preprocessor-directives,
+  -misc-include-cleaner,
+  -misc-non-private-member-variables-in-classes,
+  -misc-no-recursion,
+  -modernize-avoid-c-arrays,
+  -modernize-use-trailing-return-type,
+  -modernize-return-braced-init-list,
+  -readability-identifier-length,
+  -readability-uppercase-literal-suffix,
+  -modernize-use-nodiscard,
+  -readability-magic-numbers,
+  -readability-function-cognitive-complexity,
+  -readability-implicit-bool-conversion,
+  -readability-else-after-return,
+  -readability-braces-around-statements,
+  -readability-avoid-nested-conditional-operator,
+  -readability-math-missing-parentheses
+
+# 说明（与上面的禁用项一一对应）：
+#   easily-swappable-parameters   —— (float x, float y) 这类天然相邻同型参数，全是噪声
+#   narrowing-conversions         —— Vulkan 大量 uint32_t <-> size_t/int 互转
+#   include-cleaner               —— 对 volk / imgui 的伞形头判断不准，会建议删掉必需的 include
+#   non-private-member-variables  —— 与「POD 用 public 成员」的约定直接冲突
+#   avoid-c-arrays                —— VkXxx[] 数组要按 C 布局传给驱动
+#   use-trailing-return-type      —— 会把所有函数改写成 auto F() -> T
+#   identifier-length             —— i / j / uv / dx 会被判「太短」
+#   magic-numbers                 —— 渲染代码里的 0.5f / 3 / 1024 是本质常量
+#   function-cognitive-complexity —— init()/drawFrame() 天生长
+#   implicit-bool-conversion      —— VkBool32、SDL 的 bool 返回值互转
+#   braces-around-statements      —— 已由 clang-format 的 InsertBraces 决定（当前关闭）
+
+# 只提示本工程 src/ 下头文件的问题。
+# third_party/ 里的 submodule（SDL 也有 src/ 目录）不能匹配：正则要求 src 紧跟在
+# 工程根目录 Origin 之后，SDL/src 的上一级是 SDL，因此天然被排除。
+HeaderFilterRegex: '.*[/\\]Origin[/\\]src[/\\].*'
+ExcludeHeaderFilterRegex: '.*[/\\]third_party[/\\].*'
+
+# 空字符串 = 不把任何告警升级成错误。等命名迁移做完、存量告警清零后，
+# 可以改成 'readability-identifier-naming' 来守住命名这条线。
+WarningsAsErrors: ''
+
+# --fix 之后按 .clang-format 重新排版改动处
+FormatStyle: file
+
+CheckOptions:
+  # ---- 类型 ----
+  readability-identifier-naming.ClassCase: CamelCase
+  readability-identifier-naming.StructCase: CamelCase
+  readability-identifier-naming.UnionCase: CamelCase
+  readability-identifier-naming.EnumCase: CamelCase
+  readability-identifier-naming.EnumConstantCase: CamelCase
+  readability-identifier-naming.EnumConstantPrefix: 'k'
+  readability-identifier-naming.TypeAliasCase: CamelCase
+  readability-identifier-naming.TypedefCase: CamelCase
+  readability-identifier-naming.TypeTemplateParameterCase: CamelCase
+  readability-identifier-naming.TemplateTemplateParameterCase: CamelCase
+  readability-identifier-naming.ConceptCase: CamelCase
+
+  # ---- 函数 / 方法 ----
+  readability-identifier-naming.FunctionCase: CamelCase
+  readability-identifier-naming.MethodCase: CamelCase
+  readability-identifier-naming.ClassMethodCase: CamelCase
+  readability-identifier-naming.PublicMethodCase: CamelCase
+  readability-identifier-naming.ProtectedMethodCase: CamelCase
+  readability-identifier-naming.PrivateMethodCase: CamelCase
+  readability-identifier-naming.VirtualMethodCase: CamelCase
+
+  # SDL3 的 main callbacks 入口名由 SDL_main.h 规定，改名直接跑不起来；
+  # main 同理。这些必须豁免，而不是靠逐行 NOLINT。
+  readability-identifier-naming.FunctionIgnoredRegexp: '^(SDL_App(Init|Iterate|Event|Quit)|main|SDL_main)$'
+  # spdlog::sinks::base_sink 的虚函数是 snake_case，override 改不了基类
+  readability-identifier-naming.MethodIgnoredRegexp: '^(sink_it_|flush_)$'
+
+  # ---- 数据成员 ----
+  readability-identifier-naming.MemberCase: camelBack
+  readability-identifier-naming.PrivateMemberCase: camelBack
+  readability-identifier-naming.PrivateMemberPrefix: 'm_'
+  readability-identifier-naming.ProtectedMemberCase: camelBack
+  readability-identifier-naming.ProtectedMemberPrefix: 'm_'
+  readability-identifier-naming.PublicMemberCase: camelBack
+  # readability-identifier-naming.PublicMemberPrefix: 'm_'   # 想让 public 成员也带前缀时打开
+
+  # 类内静态常量按常量规则走
+  readability-identifier-naming.ClassConstantCase: CamelCase
+  readability-identifier-naming.ClassConstantPrefix: 'k'
+  readability-identifier-naming.StaticConstantCase: CamelCase
+  readability-identifier-naming.StaticConstantPrefix: 'k'
+
+  # ---- 变量 / 参数 ----
+  readability-identifier-naming.VariableCase: camelBack
+  readability-identifier-naming.LocalVariableCase: camelBack
+  readability-identifier-naming.StaticVariableCase: camelBack
+  readability-identifier-naming.GlobalVariableCase: camelBack
+  readability-identifier-naming.GlobalVariablePrefix: 'g_'
+  readability-identifier-naming.ParameterCase: camelBack
+  readability-identifier-naming.PointerParameterCase: camelBack
+
+  # ---- 常量 ----
+  # 工程里已有的 kRequiredApiVersion 即此规则。注意 constexpr 局部量也会被要求带 k，
+  # 这是有意的：constexpr 就是编译期常量，与放在哪个作用域无关。
+  readability-identifier-naming.ConstantCase: CamelCase
+  readability-identifier-naming.ConstantPrefix: 'k'
+  readability-identifier-naming.GlobalConstantCase: CamelCase
+  readability-identifier-naming.GlobalConstantPrefix: 'k'
+  readability-identifier-naming.ConstexprVariableCase: CamelCase
+  readability-identifier-naming.ConstexprVariablePrefix: 'k'
+  readability-identifier-naming.ConstexprFunctionCase: CamelCase
+  readability-identifier-naming.ConstexprMethodCase: CamelCase
+  # const 的局部变量 / 参数不属于「常量」，仍按普通变量命名 —— 否则
+  # const glm::quat invRot 会被要求叫 kInvRot，很荒谬。
+  readability-identifier-naming.LocalConstantCase: camelBack
+  readability-identifier-naming.LocalConstantPointerCase: camelBack
+  readability-identifier-naming.ConstantParameterCase: camelBack
+  readability-identifier-naming.ConstantPointerParameterCase: camelBack
+  readability-identifier-naming.LocalPointerCase: camelBack
+
+  # ---- 命名空间 / 宏 ----
+  readability-identifier-naming.NamespaceCase: lower_case
+  readability-identifier-naming.InlineNamespaceCase: lower_case
+  readability-identifier-naming.MacroDefinitionCase: UPPER_CASE
+  readability-identifier-naming.MacroDefinitionIgnoredRegexp: '^(ORIGIN_.*|VK_.*|SDL_.*|STB_.*|GLM_.*|IMGUI_.*|TINYGLTF_.*|VMA_.*)$'
+
+  # ---- 其余 check 的参数 ----
+  readability-qualified-auto.AddConstToQualified: false
+  modernize-use-default-member-init.UseAssignment: true
+  performance-unnecessary-value-param.AllowedTypes: 'glm::[a-z0-9]+;Vk[A-Za-z]+'
+  misc-const-correctness.AnalyzeValues: false

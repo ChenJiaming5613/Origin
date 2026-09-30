@@ -11,18 +11,17 @@ android {
     defaultConfig {
         applicationId "com.origin.app"
 
-        // minSdk 33 (Android 13) 是被 **Vulkan 1.3** 逼出来的，不是随便抬的。
+        // minSdk 33 当初是被 Vulkan 1.3 逼出来的（1.3 从 API 33 起才暴露）。
+        // 基线回退到 Vulkan 1.1 后这个约束已经消失 —— 现在的技术下限是
+        // **API 28**（Android 9，平台开始暴露 Vulkan 1.1 的版本；
+        // 平台只暴露 1.0.3 / 1.1 / 1.3 三档，没有 1.2）。
         //
-        // 本工程用 dynamic rendering，它在 Vulkan 1.3 才进入核心。而 Android
-        // 平台只暴露 1.0.3 / 1.1 / 1.3 三档（没有 1.2），其中 1.3 从
-        // Android 13 / API 33 起才可用；更低的 Android 版本即使设备驱动
-        // 支持 1.3，平台也会把它压到 1.1。
+        // 仍然留在 33 是刻意的：降 minSdk 会改变 NDK 的 target sysroot，
+        // 触发全部 native 代码（含 SDL3）全量重编，单 ABI 约 5~10 分钟，
+        // 而目前手头唯一的测试机是 Android 15，降下去没有任何实际收益。
+        // 等真的需要覆盖 Android 9~12 的设备时改成 28 即可，代码无需改动。
         //
-        // 走 VK_KHR_dynamic_rendering 扩展理论上 1.2 就够，但实测
-        // 不暴露 1.3 的 Android 设备连这个扩展都不暴露，没有兜底路线。
-        // 详见 src/VulkanRenderer.cpp 里 kRequiredApiVersion 的说明。
-        //
-        // SDL3 自身只要求 API 21，不是这里的约束。
+        // SDL3 自身只要求 API 21，从来不是这里的约束。
         minSdk 33
         targetSdk 36
         versionCode 1

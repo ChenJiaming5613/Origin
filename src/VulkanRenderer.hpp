@@ -98,6 +98,8 @@ private:
     void createDevice();
     void createSwapchain();
     void createDepthResources();
+    void createRenderPass();
+    void createFramebuffers();
     void createCubeMesh();
     void createTexture();
     void createPipeline();
@@ -115,6 +117,7 @@ private:
     void recreateSwapchain();
     void destroySwapchainDependents();
     void destroyDepthResources();
+    void destroyFramebuffers();
 
     void recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex);
 
@@ -156,6 +159,29 @@ private:
     VkDevice         device_           = VK_NULL_HANDLE;
     VkQueue          queue_            = VK_NULL_HANDLE;
 
+    // ---- 可选能力 -----------------------------------------------------------
+    //
+    // 在 pickPhysicalDevice 里探测、createDevice 里启用。两者都是 Vulkan 1.2
+    // 核心化的特性，但在 1.1 基线下**以扩展形式**可用 —— vk.xml 里它们的
+    // depends 都写着 `..., VK_VERSION_1_1`，即 1.1 单独就满足依赖
+    // （前置的 get_physical_device_properties2 / maintenance3 / device_group
+    //   都已在 1.1 核心化）。
+    //
+    // 关键约束：因为 VkApplicationInfo::apiVersion 是 1.1，**必须走带 KHR/EXT
+    // 后缀的入口**（vkGetBufferDeviceAddressKHR），不能用 1.2 的核心名
+    // （vkGetBufferDeviceAddress）—— 后者在 apiVersion < 1.2 时是未定义行为，
+    // volk 也不会为它填函数指针。这一点在所有设备上一致，包括报 1.4 的 RTX 3080，
+    // 所以仍然是单一代码路径。
+    //
+    // 这两项是后续 bindless / GPU-driven 的地基：descriptorIndexing 管
+    // 「一个大贴图数组 + 运行期算出的下标」，bufferDeviceAddress 管
+    // 「把 buffer 当裸指针传进 shader」。
+    struct OptionalCaps {
+        bool descriptorIndexing  = false;  // VK_EXT_descriptor_indexing
+        bool bufferDeviceAddress = false;  // VK_KHR_buffer_device_address
+    };
+    OptionalCaps caps_{};
+
     VkSwapchainKHR                swapchain_       = VK_NULL_HANDLE;
     VkFormat                      swapchainFormat_ = VK_FORMAT_UNDEFINED;
     VkExtent2D                    swapchainExtent_{};
@@ -170,11 +196,24 @@ private:
     VmaAllocation depthAlloc_  = VK_NULL_HANDLE;
     VkImageView   depthView_   = VK_NULL_HANDLE;
 
-    // 没有 VkRenderPass / VkFramebuffer 成员 —— 本工程用 dynamic rendering
-    // （Vulkan 1.3 核心）。附件在 recordCommandBuffer 里以
-    // VkRenderingAttachmentInfo 的形式逐帧描述，pipeline 只通过
-    // VkPipelineRenderingCreateInfo 记录附件**格式**。
-    // 好处之一：swapchain 重建时不再需要销毁重建 N 个 framebuffer。
+    // ---- render pass / framebuffer -----------------------------------------
+    //
+    // 工程基线是 Vulkan 1.1，所以走传统的 VkRenderPass 而非 dynamic rendering。
+    //
+    // 这个选择是被真机逼出来的、不是偏好：实测一加 Ace 竞速版（天玑 8100 /
+    // Mali-G610，Android 15 但 GPU 驱动还是 2021 年的 r32p1）只报 Vulkan
+    // 1.1.177，且 VK_KHR_dynamic_rendering 与 VK_KHR_synchronization2
+    // **连扩展形式都没有**。而该机的 bindless（descriptor indexing 全绿、
+    // 50 万 sampled image 上限）与 GPU-driven（multiDrawIndirect +
+    // drawIndirectCount + shaderDrawParameters）能力齐全 —— 也就是说
+    // dynamic rendering 只是写法糖，挡住的却是整台真机的实验能力。
+    //
+    // renderPass_ 只依赖**附件格式**（颜色格式 + 深度格式），跨 swapchain
+    // 重建不变，所以和 pipeline 一样只建一次。
+    // framebuffers_ 绑定具体的 image view 与尺寸，必须随 swapchain 重建 ——
+    // 这正是 dynamic rendering 想省掉的那部分样板。
+    VkRenderPass               renderPass_ = VK_NULL_HANDLE;
+    std::vector<VkFramebuffer> framebuffers_;
 
     // pipelineLayout 与 descriptorSetLayout 都在 program_ 里，由反射生成
     Program    program_{};
