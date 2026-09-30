@@ -185,7 +185,7 @@ target_link_libraries(vma PUBLIC volk::volk)
 # 也就是说它影响 ABI。若实现 TU 与调用方 TU 看到的取值不同，
 # 就是一个安静的 ODR 违规 —— 编译链接都过，运行时踩内存。
 target_compile_definitions(vma PUBLIC
-    # 我们的基线是 Vulkan 1.1（见 src/VulkanRenderer.cpp 的 kRequiredApiVersion，
+    # 我们的基线是 Vulkan 1.1（见 src/OriginRenderer.cpp 的 kRequiredApiVersion，
     # 那里写了为什么从 1.3 退回 1.1）。
     # 必须显式钉住：VMA 默认按**头文件**能力自动探测，而 Vulkan-Headers 是
     # 1.4.350，它会自动选 1004000 —— 比我们实际请求的 instance 版本高三档，
@@ -364,12 +364,17 @@ add_custom_target(origin_shaders DEPENDS ${_spv_files})
 # =============================================================================
 set(ORIGIN_SOURCES
     src/main.cpp
-    src/VulkanRenderer.cpp
+    src/OriginRenderer.cpp
     src/ShaderReflect.cpp
     src/StbImage.cpp
-    src/Camera.cpp
-    src/CameraController.cpp
     src/GltfModel.cpp
+    # camera/ —— 相机与控制器分两层：
+    #   Camera（抽象，只有位姿 + 投影）-> PerspectiveCamera
+    #   CameraController（抽象，输入 -> 位姿）-> OrbitCameraController
+    src/camera/Camera.cpp
+    src/camera/PerspectiveCamera.cpp
+    src/camera/CameraController.cpp
+    src/camera/OrbitCameraController.cpp
 )
 # 注意 src/VmaImpl.cpp 刻意**不**列在这里：
 # 它已经是 vma target 的唯一源文件（见上面的 add_library(vma ...)）。

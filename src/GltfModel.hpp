@@ -9,7 +9,7 @@
 
 namespace origin {
 
-struct Vertex;  // VulkanRenderer.hpp
+struct Vertex;  // OriginRenderer.hpp
 
 // glTF 2.0 导入结果。
 //

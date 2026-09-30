@@ -14,7 +14,7 @@
           十进制 4198400 就是 0x401000）。
 
          这里曾经写 0x403000（1.3），因为工程一度用 dynamic rendering。
-         回退到 render pass 后基线降到 1.1，见 src/VulkanRenderer.cpp 的
+         回退到 render pass 后基线降到 1.1，见 src/OriginRenderer.cpp 的
          kRequiredApiVersion。
 
          ⚠️ 这条声明只在**应用商店侧**过滤设备，`adb install` 完全不受它约束 ——

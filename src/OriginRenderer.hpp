@@ -1,9 +1,10 @@
 #pragma once
 
-#include "Camera.hpp"
 #include "GltfModel.hpp"
 #include "ShaderReflect.hpp"
 #include "Vertex.hpp"
+#include "camera/OrbitCameraController.h"
+#include "camera/PerspectiveCamera.h"
 
 #include <volk.h>
 
@@ -19,13 +20,13 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
-namespace origin {
-
-class CameraController;
+namespace origin
+{
 
 // 必须和 shaders/cube.vs.hlsl 里的 PushConstants 严格一致。
 // 这个一致性由 ShaderReflect 的 checkPushConstantSize 在启动期校验 ——
@@ -60,7 +61,7 @@ struct LightingParams {
 // 本文件没有任何平台头文件：surface 交给 SDL_Vulkan_CreateSurface，
 // 资源读取交给 SDL_LoadFile（Android 上自动走 APK assets），
 // 因此同一份代码在 Windows 与 Android 上都能直接用。
-class VulkanRenderer {
+class OriginRenderer {
 public:
     void init(SDL_Window* window);
     void shutdown();
@@ -80,15 +81,20 @@ public:
     LightingParams&       lighting() { return lighting_; }
     const LightingParams& lighting() const { return lighting_; }
 
-    // 暴露给 CameraController 操作。渲染器只负责每帧把 aspect 喂给它、
-    // 并取 viewProj 算 MVP，不参与输入处理。
+    // 渲染器持有相机与控制器（而不是由 main.cpp 注入）。
+    //
+    // 换成持有是被顺序逼出来的：createCubeMesh 里加载完 glTF 就要按包围盒
+    // 调 FrameBounds 设初始距离，而那时候 main.cpp 还没机会创建控制器。
+    // 旧版把控制器放在 main.cpp、用 setCameraController 弱引用注入，
+    // 于是"设初始距离"只能塞进 Camera（让相机类背上了轨道参数）。
+    // 现在相机与控制器的生命周期都归渲染器，main.cpp 只负责转发事件。
+    //
+    // 返回基类引用：需要 vp 矩阵的地方不该关心是透视还是正交。
     Camera&       camera() { return camera_; }
     const Camera& camera() const { return camera_; }
 
-    // 可选注入：只为了让 ImGui 面板能调灵敏度和复位。
-    // 渲染器**不**通过它处理输入 —— 事件分流仍在 main.cpp 里，
-    // 这里只是个面板用的弱引用（不持有所有权）。
-    void setCameraController(CameraController* c) { cameraController_ = c; }
+    // 事件转发与面板调参都通过它。可能为 nullptr（init 之前）。
+    OrbitCameraController* cameraController() { return cameraController_.get(); }
 
 private:
     void createInstance();
@@ -266,8 +272,14 @@ private:
 
     bool imguiReady_ = false;
 
-    Camera            camera_;
-    CameraController* cameraController_ = nullptr;  // 不持有
+    // 具体类型是 PerspectiveCamera；对外只暴露 Camera&。
+    // 将来要支持运行时切正交相机，把它换成 std::unique_ptr<Camera> 即可 ——
+    // 使用侧（camera().ViewProj() / SetAspect）不用改，因为那些都在基类上。
+    PerspectiveCamera camera_;
+
+    // 控制器持有 camera_ 的引用，所以必须在它之后声明（销毁顺序相反）。
+    // 用 unique_ptr 而非直接持有：构造时要传 SDL_Window*，而那要等 init()。
+    std::unique_ptr<OrbitCameraController> cameraController_;
 
     // 启动时加载的 glTF 模型。加载失败会退回内置 cube（valid() == false），
     // 这样链路依然可见，而不是黑屏。

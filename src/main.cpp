@@ -19,13 +19,13 @@
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_init.h>
 
-#include <imgui_impl_sdl3.h>
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_video.h>
+#include <imgui_impl_sdl3.h>
 
+#include "camera/CameraController.h"
 #include "Log.hpp"
-#include "CameraController.hpp"
-#include "VulkanRenderer.hpp"
+#include "OriginRenderer.hpp"
 
 #include <spdlog/sinks/base_sink.h>
 
@@ -35,36 +35,47 @@
 #include <string>
 
 namespace origin {
-namespace {
 
+namespace {
 // 把 spdlog 的输出转发给 SDL_Log 的自定义 sink。
 //
 // 这样做而不是用 spdlog 自带的 android_sink，是为了让日志也变成平台无关的：
 // SDL_Log 在 Android 上落到 logcat，在 Windows 上落到控制台/调试输出，
 // 于是这里既不需要 #ifdef __ANDROID__，也不需要链接 Android 的 liblog。
-template <typename Mutex>
-class SdlSink : public spdlog::sinks::base_sink<Mutex> {
+template <typename Mutex> class SdlSink : public spdlog::sinks::base_sink<Mutex>
+{
 protected:
-    void sink_it_(const spdlog::details::log_msg& msg) override {
+    void sink_it_(const spdlog::details::log_msg& msg) override
+    {
         spdlog::memory_buf_t buf;
         this->formatter_->format(msg, buf);
 
         // spdlog 的 formatter 默认会带换行，SDL_Log 自己也会加，去掉尾部空白
         std::string text(buf.data(), buf.size());
-        while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+        {
             text.pop_back();
         }
 
         SDL_LogPriority pri = SDL_LOG_PRIORITY_INFO;
-        if (msg.level == spdlog::level::trace) {
+        if (msg.level == spdlog::level::trace)
+        {
             pri = SDL_LOG_PRIORITY_VERBOSE;
-        } else if (msg.level == spdlog::level::debug) {
+        }
+        else if (msg.level == spdlog::level::debug)
+        {
             pri = SDL_LOG_PRIORITY_DEBUG;
-        } else if (msg.level == spdlog::level::warn) {
+        }
+        else if (msg.level == spdlog::level::warn)
+        {
             pri = SDL_LOG_PRIORITY_WARN;
-        } else if (msg.level == spdlog::level::err) {
+        }
+        else if (msg.level == spdlog::level::err)
+        {
             pri = SDL_LOG_PRIORITY_ERROR;
-        } else if (msg.level == spdlog::level::critical) {
+        }
+        else if (msg.level == spdlog::level::critical)
+        {
             pri = SDL_LOG_PRIORITY_CRITICAL;
         }
 
@@ -75,10 +86,10 @@ protected:
 };
 
 using SdlSinkMt = SdlSink<std::mutex>;
-
 }  // namespace
 
-void initLogging() {
+void initLogging()
+{
     auto sink   = std::make_shared<SdlSinkMt>();
     auto logger = std::make_shared<spdlog::logger>("main", sink);
     logger->set_level(spdlog::level::debug);
@@ -87,80 +98,84 @@ void initLogging() {
     // logcat 与 SDL 都会自带时间戳和等级，这里只输出消息体
     spdlog::set_pattern("%v");
 }
-
 }  // namespace origin
 
 namespace {
-
-struct AppState {
+struct AppState
+{
     SDL_Window*            window = nullptr;
-    origin::VulkanRenderer renderer;
-    // 控制器要引用渲染器持有的 Camera，而 Camera 在 renderer.init() 之后
-    // 才被设好初始距离，所以用 unique_ptr 延迟到那之后再构造。
-    std::unique_ptr<origin::CameraController> camera;
+    origin::OriginRenderer renderer;
+    // 相机与控制器都归渲染器持有：init() 里加载完 glTF 就要按包围盒设初始
+    // 距离，那一步必须在控制器已经存在时做。这里只通过
+    // renderer.cameraController() 转发事件。
 };
-
 }  // namespace
 
-SDL_AppResult SDL_AppInit(void** appstate, int /*argc*/, char** /*argv*/) {
+SDL_AppResult SDL_AppInit(void** appstate, int /*argc*/, char** /*argv*/)
+{
     origin::initLogging();
     spdlog::info("SDL_AppInit");
 
-    // SDL3 的初始化函数返回 bool（SDL2 返回 int，0 表示成功），注意别写反
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL_Init 失败: %s", SDL_GetError());
+    if (!SDL_Init(SDL_INIT_VIDEO))
+    {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL_Init Failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
 
     // Android 上宽高会被忽略（窗口总是全屏），这里的值只对桌面构建生效。
     // SDL_WINDOW_VULKAN 会让 SDL 加载 Vulkan loader，
     // 之后 SDL_Vulkan_GetVkGetInstanceProcAddr() 才可用。
-    SDL_Window* window = SDL_CreateWindow("Origin", 1280, 720,
-                                          SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
-    if (window == nullptr) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL_CreateWindow 失败: %s", SDL_GetError());
+    SDL_Window* window = SDL_CreateWindow("Origin", 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+    if (window == nullptr)
+    {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL_CreateWindow Failed: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
 
     auto state    = std::make_unique<AppState>();
     state->window = window;
 
-    try {
+    try
+    {
         state->renderer.init(window);
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception& e)
+    {
         spdlog::error("渲染器初始化失败: {}", e.what());
         state->renderer.shutdown();
         SDL_DestroyWindow(window);
         return SDL_APP_FAILURE;
     }
 
-    // 相机控制器。必须在 init() 之后构造：init 里加载完 glTF 才会按模型
-    // 包围盒设好初始距离与距离上下限，提前构造拿不到这些值。
-    state->camera = std::make_unique<origin::CameraController>(state->renderer.camera(), window);
-    state->renderer.setCameraController(state->camera.get());
-
     // 交出所有权，之后由 SDL_AppQuit 负责释放
     *appstate = state.release();
     return SDL_APP_CONTINUE;
 }
 
-SDL_AppResult SDL_AppIterate(void* appstate) {
+SDL_AppResult SDL_AppIterate(void* appstate)
+{
     auto* state = static_cast<AppState*>(appstate);
 
-    if (state->renderer.ready()) {
-        try {
+    if (state->renderer.ready())
+    {
+        try
+        {
             state->renderer.drawFrame();
 
             // 自动化/无人值守验证用：设了 ORIGIN_SHOT 就在第 40 帧存一张图
             // （等几帧是为了让 swapchain 重建、ImGui 首帧字体上传都完成）。
             // 交互时用面板上的 Screenshot 按钮即可。
             static int frame = 0;
-            if (++frame == 40) {
-                if (const char* p = SDL_getenv("ORIGIN_SHOT")) {
+            if (++frame == 40)
+            {
+                if (const char* p = SDL_getenv("ORIGIN_SHOT"))
+                {
                     state->renderer.requestScreenshot(p);
                 }
             }
-        } catch (const std::exception& e) {
+        }
+        catch (const std::exception& e)
+        {
             spdlog::error("drawFrame 异常: {}", e.what());
             return SDL_APP_FAILURE;
         }
@@ -168,7 +183,8 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
     return SDL_APP_CONTINUE;
 }
 
-SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
+SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event)
+{
     auto* state = static_cast<AppState*>(appstate);
 
     // 先喂给 ImGui。不做这一步面板能画出来但完全点不动 ——
@@ -181,13 +197,17 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
     //
     // 注意 WantCaptureMouse 是 ImGui 上一帧算出来的状态，对「拖动中途
     // 鼠标移出面板」这种情况仍然有效（ImGui 会保持捕获直到松开）。
-    if (state->camera != nullptr && !ImGui::GetIO().WantCaptureMouse) {
-        if (state->camera->handleEvent(*event)) {
+    origin::CameraController* camera = state->renderer.cameraController();
+    if (camera != nullptr && !ImGui::GetIO().WantCaptureMouse)
+    {
+        if (camera->HandleEvent(*event))
+        {
             return SDL_APP_CONTINUE;  // 已被相机消费，不再往下走
         }
     }
 
-    switch (event->type) {
+    switch (event->type)
+    {
         case SDL_EVENT_QUIT:
             spdlog::info("SDL_EVENT_QUIT");
             return SDL_APP_SUCCESS;
@@ -206,8 +226,9 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
             spdlog::info("即将进入后台");
             // 清掉按下/触摸状态。不清的话，在拖动中切后台再回来，
             // 控制器仍以为按键按着，下一次移动会产生一次巨大的跳变旋转。
-            if (state->camera != nullptr) {
-                state->camera->resetInputState();
+            if (camera != nullptr)
+            {
+                camera->ResetInputState();
             }
             break;
         case SDL_EVENT_DID_ENTER_FOREGROUND:
@@ -223,13 +244,16 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
     return SDL_APP_CONTINUE;
 }
 
-void SDL_AppQuit(void* appstate, SDL_AppResult /*result*/) {
+void SDL_AppQuit(void* appstate, SDL_AppResult /*result*/)
+{
     spdlog::info("SDL_AppQuit");
 
-    if (appstate != nullptr) {
+    if (appstate != nullptr)
+    {
         auto* state = static_cast<AppState*>(appstate);
         state->renderer.shutdown();
-        if (state->window != nullptr) {
+        if (state->window != nullptr)
+        {
             SDL_DestroyWindow(state->window);
         }
         delete state;

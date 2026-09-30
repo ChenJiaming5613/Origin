@@ -1,6 +1,6 @@
-#include "VulkanRenderer.hpp"
+#include "OriginRenderer.hpp"
 
-#include "CameraController.hpp"
+
 #include "ImageWrite.hpp"
 #include "Log.hpp"
 
@@ -352,7 +352,7 @@ void logDeviceCapabilities(VkPhysicalDevice dev, const VkPhysicalDevicePropertie
 // 生命周期
 // =============================================================================
 
-void VulkanRenderer::init(SDL_Window* window) {
+void OriginRenderer::init(SDL_Window* window) {
     window_ = window;
 
     // 关键：用 volkInitializeCustom 而不是 volkInitialize。
@@ -396,6 +396,10 @@ void VulkanRenderer::init(SDL_Window* window) {
     createRenderPass();
     createFramebuffers();
 
+    // 控制器必须在 createCubeMesh 之前建好：那里加载完 glTF 会调
+    // FrameBounds 按模型包围盒设初始距离与距离上下限。
+    cameraController_ = std::make_unique<OrbitCameraController>(camera_, window_);
+
     createCubeMesh();
     createTexture();
 
@@ -414,7 +418,7 @@ void VulkanRenderer::init(SDL_Window* window) {
                  swapchainImages_.size(), static_cast<int>(depthFormat_));
 }
 
-void VulkanRenderer::shutdown() {
+void OriginRenderer::shutdown() {
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
     }
@@ -530,7 +534,7 @@ void VulkanRenderer::shutdown() {
 // Instance / Device
 // =============================================================================
 
-void VulkanRenderer::createInstance() {
+void OriginRenderer::createInstance() {
     // 先问 loader 支不支持 1.1，再去填 appInfo.apiVersion。
     //
     // 这一步不能省：在纯 1.0 loader 上直接把 apiVersion 填 1.1，
@@ -607,7 +611,7 @@ void VulkanRenderer::createInstance() {
     VK_CHECK(vkCreateInstance(&info, nullptr, &instance_));
 }
 
-void VulkanRenderer::setupDebugMessenger() {
+void OriginRenderer::setupDebugMessenger() {
 #if ORIGIN_ENABLE_VALIDATION
     if (vkCreateDebugUtilsMessengerEXT == nullptr) {
         return;
@@ -624,7 +628,7 @@ void VulkanRenderer::setupDebugMessenger() {
 #endif
 }
 
-void VulkanRenderer::createSurface() {
+void OriginRenderer::createSurface() {
     // 整个工程里唯一一次「窗口系统绑定」，且已经是平台无关的。
     if (!SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_)) {
         throw std::runtime_error(std::string("SDL_Vulkan_CreateSurface 失败: ") +
@@ -632,7 +636,7 @@ void VulkanRenderer::createSurface() {
     }
 }
 
-void VulkanRenderer::pickPhysicalDevice() {
+void OriginRenderer::pickPhysicalDevice() {
     uint32_t count = 0;
     VK_CHECK(vkEnumeratePhysicalDevices(instance_, &count, nullptr));
     if (count == 0) {
@@ -772,7 +776,7 @@ void VulkanRenderer::pickPhysicalDevice() {
                  caps_.descriptorIndexing, caps_.bufferDeviceAddress);
 }
 
-void VulkanRenderer::createDevice() {
+void OriginRenderer::createDevice() {
     const float priority = 1.0f;
 
     VkDeviceQueueCreateInfo queueInfo{};
@@ -844,7 +848,7 @@ void VulkanRenderer::createDevice() {
     }
 }
 
-void VulkanRenderer::createAllocator() {
+void OriginRenderer::createAllocator() {
     // VMA 需要一组 Vulkan 函数指针。因为工程用 volk（VK_NO_PROTOTYPES），
     // 不能让它去引用静态原型，所以走 VMA_DYNAMIC_VULKAN_FUNCTIONS=1：
     // 只把两个 getter 交给它，剩下三十多个由它自己 fetch。
@@ -901,7 +905,7 @@ void VulkanRenderer::createAllocator() {
 // Swapchain
 // =============================================================================
 
-void VulkanRenderer::createSwapchain() {
+void OriginRenderer::createSwapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice_, surface_, &caps));
 
@@ -1031,7 +1035,7 @@ void VulkanRenderer::createSwapchain() {
     }
 }
 
-void VulkanRenderer::createRenderPass() {
+void OriginRenderer::createRenderPass() {
     // 只依赖附件的**格式**，不依赖尺寸 —— 所以和 pipeline 一样只建一次，
     // swapchain 重建时不用动（重建的只有 framebuffer）。
     //
@@ -1120,7 +1124,7 @@ void VulkanRenderer::createRenderPass() {
     VK_CHECK(vkCreateRenderPass(device_, &info, nullptr, &renderPass_));
 }
 
-void VulkanRenderer::createFramebuffers() {
+void OriginRenderer::createFramebuffers() {
     // 每张 swapchain image 一个 framebuffer，深度图是所有 framebuffer 共用的
     // （只有一帧在飞时深度可以复用；将来若做多帧并行写深度，这里要改成每帧一份）。
     framebuffers_.resize(swapchainImageViews_.size());
@@ -1143,14 +1147,14 @@ void VulkanRenderer::createFramebuffers() {
     }
 }
 
-void VulkanRenderer::destroyFramebuffers() {
+void OriginRenderer::destroyFramebuffers() {
     for (VkFramebuffer fb : framebuffers_) {
         vkDestroyFramebuffer(device_, fb, nullptr);
     }
     framebuffers_.clear();
 }
 
-void VulkanRenderer::destroyDepthResources() {
+void OriginRenderer::destroyDepthResources() {
     if (depthView_ != VK_NULL_HANDLE) {
         vkDestroyImageView(device_, depthView_, nullptr);
         depthView_ = VK_NULL_HANDLE;
@@ -1162,7 +1166,7 @@ void VulkanRenderer::destroyDepthResources() {
     }
 }
 
-void VulkanRenderer::destroySwapchainDependents() {
+void OriginRenderer::destroySwapchainDependents() {
     // 截图缓冲的大小跟 swapchain 尺寸绑定，尺寸变了必须重建
     if (screenshotBuffer_ != VK_NULL_HANDLE) {
         vmaDestroyBuffer(allocator_, screenshotBuffer_, screenshotAlloc_);
@@ -1187,7 +1191,7 @@ void VulkanRenderer::destroySwapchainDependents() {
     }
 }
 
-void VulkanRenderer::recreateSwapchain() {
+void OriginRenderer::recreateSwapchain() {
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window_, &w, &h);
     if (w <= 0 || h <= 0) {
@@ -1251,7 +1255,7 @@ void VulkanRenderer::recreateSwapchain() {
 // Pipeline
 // =============================================================================
 
-void VulkanRenderer::createPipeline() {
+void OriginRenderer::createPipeline() {
     // ---- 反射驱动的 layout 生成 --------------------------------------------
     // createShaderStage 内部用 SPIRV-Reflect 解析 SPIR-V，
     // createProgram 据此生成 VkDescriptorSetLayout 与 VkPipelineLayout。
@@ -1396,7 +1400,7 @@ void VulkanRenderer::createPipeline() {
 // 命令与同步
 // =============================================================================
 
-void VulkanRenderer::createCommandBuffers() {
+void OriginRenderer::createCommandBuffers() {
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1412,7 +1416,7 @@ void VulkanRenderer::createCommandBuffers() {
     VK_CHECK(vkAllocateCommandBuffers(device_, &allocInfo, commandBuffers_.data()));
 }
 
-void VulkanRenderer::createSyncObjects() {
+void OriginRenderer::createSyncObjects() {
     VkSemaphoreCreateInfo semInfo{};
     semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
@@ -1435,7 +1439,7 @@ void VulkanRenderer::createSyncObjects() {
     }
 }
 
-void VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
+void OriginRenderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageIndex) {
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
@@ -1515,12 +1519,14 @@ void VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageInde
     }
     // 注意喂给相机的是**可见区域**的宽高比（已按 transform 对调），
     // 不是 framebuffer 的宽高比 —— 两者在 pre-rotation 路径下并不相同。
-    camera_.setAspect(fbWidth / fbHeight);
+    camera_.SetAspect(fbWidth / fbHeight);
 
-    // 投影的 Y 翻转与 [0,1] 深度都在 Camera::proj() 里处理。
+    // 投影的 Y 翻转与 [0,1] 深度都在 Camera::Proj() 里处理。
     // 但 pre-rotation 的那次旋转刻意留在渲染器：它属于呈现层的事，
     // 和「相机怎么看世界」无关，放进 Camera 会让相机类耦合 Android 的呈现细节。
-    glm::mat4 viewProj = camera_.viewProj();
+    //
+    // 在循环外取一次 —— ViewProj() 没有缓存，每次调用都会重算矩阵。
+    glm::mat4 viewProj = camera_.ViewProj();
     if (rotateDeg != 0.0f) {
         // 左乘：等价于官方文档写的 MVP = pre_rotate * MVP
         viewProj = glm::rotate(glm::mat4(1.0f), glm::radians(rotateDeg),
@@ -1662,7 +1668,7 @@ void VulkanRenderer::recordCommandBuffer(VkCommandBuffer cmd, uint32_t imageInde
 // 每帧绘制
 // =============================================================================
 
-void VulkanRenderer::drawFrame() {
+void OriginRenderer::drawFrame() {
     // ---- 时间推进 -----------------------------------------------------------
     // 旋转角按 dt 累加而不是用绝对时间：面板上暂停或改速度时角度才是连续的，
     // 用 (now - start) * speed 的话一改速度就会跳变。
@@ -1763,13 +1769,13 @@ void VulkanRenderer::drawFrame() {
 // 截图
 // =============================================================================
 
-void VulkanRenderer::requestScreenshot(const char* path) {
+void OriginRenderer::requestScreenshot(const char* path) {
     screenshotPath_    = path;
     screenshotPending_ = true;
     ensureScreenshotBuffer();
 }
 
-void VulkanRenderer::ensureScreenshotBuffer() {
+void OriginRenderer::ensureScreenshotBuffer() {
     const VkDeviceSize need =
         static_cast<VkDeviceSize>(swapchainExtent_.width) * swapchainExtent_.height * 4;
     if (screenshotBuffer_ != VK_NULL_HANDLE && screenshotSize_ == need) {
@@ -1792,7 +1798,7 @@ void VulkanRenderer::ensureScreenshotBuffer() {
     screenshotSize_ = need;
 }
 
-void VulkanRenderer::writePendingScreenshot() {
+void OriginRenderer::writePendingScreenshot() {
     screenshotPending_ = false;
     if (screenshotBuffer_ == VK_NULL_HANDLE) {
         return;
@@ -1832,7 +1838,7 @@ void VulkanRenderer::writePendingScreenshot() {
 // 资源读取
 // =============================================================================
 
-std::vector<uint8_t> VulkanRenderer::readAsset(std::string_view path) {
+std::vector<uint8_t> OriginRenderer::readAsset(std::string_view path) {
     // SDL_LoadFile 在 Android 上会自动走 APK 的 AAssetManager，
     // 在桌面端则是普通文件读取 —— 于是这里不需要任何平台分支。
     //
@@ -1871,7 +1877,7 @@ void imguiCheckVkResult(VkResult r) {
 }
 }  // namespace
 
-void VulkanRenderer::initImGui() {
+void OriginRenderer::initImGui() {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
@@ -1975,7 +1981,7 @@ void VulkanRenderer::initImGui() {
                  IMGUI_VERSION, uiDpiScale_);
 }
 
-void VulkanRenderer::shutdownImGui() {
+void OriginRenderer::shutdownImGui() {
     if (!imguiReady_) {
         return;
     }
@@ -1985,7 +1991,7 @@ void VulkanRenderer::shutdownImGui() {
     ImGui::DestroyContext();
 }
 
-void VulkanRenderer::buildUi() {
+void OriginRenderer::buildUi() {
     // 界面文字用英文：ImGui 默认字体（ProggyClean）不含中文字形，
     // 直接写中文会渲染成方框。要中文界面得额外加一个 TTF 资源 +
     // ImFontGlyphRangesBuilder，且 Android 侧还要把字体打进 APK，
@@ -2021,21 +2027,29 @@ void VulkanRenderer::buildUi() {
         // 叠加在它之上的用户偏好（style.FontScaleMain），改完立即生效 ——
         // 1.92 的字体是动态光栅化的，不需要重建字体图集。
         ImGui::SeparatorText("Camera");
-        ImGui::Text("distance %.2f  (drag=orbit, wheel/pinch=zoom)", camera_.distance());
         if (cameraController_ != nullptr) {
+            // distance / target 现在归控制器 —— Camera 只有位姿，不知道"轨道"这回事
+            ImGui::Text("distance %.2f  (drag=orbit, wheel/pinch=zoom)",
+                        cameraController_->Distance());
             ImGui::SliderFloat("Orbit speed", &cameraController_->rotateSpeed, 0.2f, 3.0f,
                                "%.2f");
             ImGui::SliderFloat("Zoom speed", &cameraController_->zoomSpeed, 0.2f, 3.0f,
                                "%.2f");
             ImGui::Checkbox("Invert Y", &cameraController_->invertY);
-        }
-        if (ImGui::Button("Reset view")) {
-            camera_.reset();
-            if (model_.valid()) {
-                const float radius = std::max(model_.boundsRadius(), 0.001f);
-                camera_.setDistance(radius / std::tan(glm::radians(30.0f)) * 1.6f);
+
+            if (ImGui::Button("Reset view")) {
+                if (model_.valid()) {
+                    // 复位到"正好框住模型"，而不是 Reset() 的固定距离 3。
+                    // FrameBounds 内部用 HalfExtentAtDistance 反解距离，
+                    // 所以这里不需要再手写 tan(fov/2)。
+                    cameraController_->FrameBounds(model_.boundsCenter(),
+                                                   model_.boundsRadius());
+                } else {
+                    cameraController_->Reset();
+                }
             }
         }
+        ImGui::Text("fovY %.0f°", camera_.FovY());
 
         ImGui::SeparatorText("UI");
         ImGui::SliderFloat("Font scale", &ImGui::GetStyle().FontScaleMain, 0.5f, 3.0f,
@@ -2103,7 +2117,7 @@ void VulkanRenderer::buildUi() {
 // 它忽略了堆大小、是否 cached、以及设备可能有多个同样满足条件但性能不同的
 // 内存类型 —— VMA 的 AUTO 会把这些都考虑进去。
 
-VkFormat VulkanRenderer::findDepthFormat() const {
+VkFormat OriginRenderer::findDepthFormat() const {
     // 按偏好顺序试：优先纯深度（不带 stencil，移动端带宽更省）。
     // D32_SFLOAT 在桌面上必然支持，但移动端不保证，所以要真去查。
     const VkFormat candidates[] = {
@@ -2123,7 +2137,7 @@ VkFormat VulkanRenderer::findDepthFormat() const {
     throw std::runtime_error("没有可用的深度格式");
 }
 
-void VulkanRenderer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+void OriginRenderer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
                                   VmaAllocationCreateFlags allocFlags, VkBuffer& buffer,
                                   VmaAllocation& allocation) const {
     VkBufferCreateInfo info{};
@@ -2150,7 +2164,7 @@ void VulkanRenderer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
     VK_CHECK(vmaCreateBuffer(allocator_, &info, &allocInfo, &buffer, &allocation, nullptr));
 }
 
-VkCommandBuffer VulkanRenderer::beginOneTimeCommands() {
+VkCommandBuffer OriginRenderer::beginOneTimeCommands() {
     VkCommandBufferAllocateInfo alloc{};
     alloc.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     alloc.commandPool        = commandPool_;
@@ -2167,7 +2181,7 @@ VkCommandBuffer VulkanRenderer::beginOneTimeCommands() {
     return cmd;
 }
 
-void VulkanRenderer::endOneTimeCommands(VkCommandBuffer cmd) {
+void OriginRenderer::endOneTimeCommands(VkCommandBuffer cmd) {
     VK_CHECK(vkEndCommandBuffer(cmd));
 
     VkSubmitInfo submit{};
@@ -2182,7 +2196,7 @@ void VulkanRenderer::endOneTimeCommands(VkCommandBuffer cmd) {
     vkFreeCommandBuffers(device_, commandPool_, 1, &cmd);
 }
 
-void VulkanRenderer::uploadViaStaging(const void* data, VkDeviceSize size,
+void OriginRenderer::uploadViaStaging(const void* data, VkDeviceSize size,
                                       VkBufferUsageFlags usage, VkBuffer& buffer,
                                       VmaAllocation& allocation) {
     VkBuffer      staging      = VK_NULL_HANDLE;
@@ -2223,7 +2237,7 @@ void VulkanRenderer::uploadViaStaging(const void* data, VkDeviceSize size,
 // 深度缓冲
 // =============================================================================
 
-void VulkanRenderer::createDepthResources() {
+void OriginRenderer::createDepthResources() {
     depthFormat_ = findDepthFormat();
 
     VkImageCreateInfo info{};
@@ -2272,7 +2286,7 @@ void VulkanRenderer::createDepthResources() {
 // Cube 网格与纹理
 // =============================================================================
 
-void VulkanRenderer::createCubeMesh() {
+void OriginRenderer::createCubeMesh() {
     // 优先加载 glTF 模型；失败则退回内置 cube。
     //
     // 这个退路不是摆设：模型文件可能没被打进 APK、或者用户换了个
@@ -2298,13 +2312,14 @@ void VulkanRenderer::createCubeMesh() {
         idxBytes = model_.indices().size() * sizeof(uint32_t);
         idxCount = static_cast<uint32_t>(model_.indices().size());
 
-        // 让相机自动取一个能把模型完整收进画面的距离。
+        // 让相机自动取一个能把模型完整收进画面的距离与合理的缩放上下限。
         // 不这么做的话，DamagedHelmet（半径约 1）和 Sponza（半径几十）
         // 用同一个固定距离会一个偏小一个塞满屏幕。
-        // /tan(fov/2) 是让包围球正好内切于竖直视野，再留 1.6 倍余量。
-        const float radius = std::max(model_.boundsRadius(), 0.001f);
-        camera_.setDistanceLimits(radius * 0.1f, radius * 50.0f);
-        camera_.setDistance(radius / std::tan(glm::radians(30.0f)) * 1.6f);
+        //
+        // 换算逻辑整块搬进了 OrbitCameraController::FrameBounds ——
+        // 这里不再出现 tan(fov/2)，因为"多远才装得下"取决于投影类型，
+        // 那是相机该回答的问题（见 Camera::HalfExtentAtDistance）。
+        cameraController_->FrameBounds(model_.boundsCenter(), model_.boundsRadius());
         modelCenter_ = model_.boundsCenter();
     }
 
@@ -2355,7 +2370,7 @@ void VulkanRenderer::createCubeMesh() {
     }
 }
 
-void VulkanRenderer::createTexture() {
+void OriginRenderer::createTexture() {
     // 先把整个文件读进内存（Android 上走 APK assets），再交给 stb 解码。
     // 用 stbi_load_from_memory 而不是 stbi_load：后者要 fopen，
     // 而 APK 内的 asset 没有文件系统路径 —— 这也是 StbImage.cpp 里
@@ -2509,7 +2524,7 @@ void VulkanRenderer::createTexture() {
 // 描述符集
 // =============================================================================
 
-void VulkanRenderer::createDescriptorSet() {
+void OriginRenderer::createDescriptorSet() {
     // 池的大小直接由反射出的 binding 表推出来 —— 不需要手写
     // 「1 个 sampled image + 1 个 sampler」这种会和 shader 脱节的常量。
     std::vector<VkDescriptorPoolSize> poolSizes;

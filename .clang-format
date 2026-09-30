@@ -1,15 +1,22 @@
 # Origin 代码格式 —— 唯一真源（IDE / CI / 脚本全部读这一份）。
 #
-# 基线取官方 Microsoft 预设：4 空格缩进、120 列、指针左贴类型、Allman 大括号。
-# 然后只覆盖两处与本工程约定不符的地方（大括号的控制流分支、注释重排）。
+# 基线取官方 Microsoft 预设：4 空格缩进、120 列、指针左贴类型、完整 Allman 大括号
+# （函数 / 类 / struct / enum / if / for / while 的 { 全部换行）。
 #
 # 为什么不是别的官方预设：
-#   LLVM / Google / Chromium  —— { 一律跟在行尾（Attach），不满足"函数体 { 换行"
-#   GNU                       —— Allman 但额外缩进大括号本身（IndentBraces），很少有人用
+#   LLVM / Google / Chromium  —— { 一律跟在行尾（Attach），不满足"{ 换行"
+#   GNU                       —— Allman 但额外缩进大括号本身（IndentBraces: true），
+#                                极少有人用；见下面 IndentBraces 处的警告
 #   WebKit                    —— 只有函数定义换行，但 ColumnLimit=0（不限行宽）
-#   Mozilla                   —— 大括号行为正是我们要的，但 IndentWidth=2 / ColumnLimit=80
+#   Mozilla                   —— 函数/类换行但控制流同行，且 IndentWidth=2 / ColumnLimit=80
 #                                且 AlwaysBreakAfterDefinitionReturnType=TopLevel（返回类型独占一行）
-#   Microsoft                 —— 缩进/列宽/指针对齐全中，仅 if/for 的 { 也换行，改一行即可
+#   Microsoft                 —— 缩进 / 列宽 / 指针对齐 / 大括号全中，几乎就是我们要的
+#
+# 相对 Microsoft 预设实际只改了 4 处 BraceWrapping（其余保持预设值）：
+#   AfterNamespace:      false  namespace origin { 保持同行，少一层视觉噪声
+#   BeforeLambdaBody:    true   lambda 体也换行，与整体 Allman 一致
+#   SplitEmptyFunction:  false  void Tick() {} 允许压成一行
+#   AfterControlStatement/BeforeElse/BeforeCatch 显式写出（与预设同值），便于对照
 #
 # 注意：clang-format 只管"排版"，完全不管"命名"。m_camelCase / CamelCase
 # 这类标识符规则没有任何 clang-format 选项能表达，由 .clang-tidy 的
@@ -19,10 +26,10 @@ Language: Cpp
 BasedOnStyle: Microsoft
 Standard: c++20
 
-# ---- 大括号：定义换行，控制流同行 ------------------------------------------
-# Microsoft 预设是彻底的 Allman（连 if/for 的 { 都换行）。这里保留"函数 / 类 /
-# struct / enum 定义"的换行，把控制流拉回行尾 —— 净效果等同官方 Mozilla 的
-# 大括号行为，但缩进与列宽仍沿用 Microsoft。
+# ---- 大括号：完整 Allman，全部换行 -----------------------------------------
+# 用 Custom 而不是直接 `BreakBeforeBraces: Allman`，是为了能单独调
+# AfterNamespace / BeforeLambdaBody / SplitEmptyFunction 这几项 ——
+# BreakBeforeBraces 只要不是 Custom，整个 BraceWrapping 块就会被忽略。
 BreakBeforeBraces: Custom
 BraceWrapping:
   AfterClass:            true
@@ -30,17 +37,31 @@ BraceWrapping:
   AfterUnion:            true
   AfterEnum:             true
   AfterFunction:         true
-  AfterNamespace:        false   # namespace origin { 保持同行，少一层视觉噪声
-  AfterExternBlock:      false
-  AfterControlStatement: Never   # if / else / for / while / switch 的 { 不换行
-  BeforeElse:            false
-  BeforeCatch:           false
+  AfterNamespace:        false
+  AfterExternBlock:      true
+  AfterControlStatement: true
+  BeforeElse:            true
+  BeforeCatch:           true
+  # BeforeWhile 管的**不是**循环头（那是 AfterControlStatement），而是
+  # do-while 里 while 关键字前是否换行。设 true 会把惯用的
+  #     do { ... } while (0)
+  # 拆成 `}` 和 `while (0)` 两行 —— VK_CHECK 这类宏会因此多一行续行符，
+  # 而 `} while (...)` 连写是压倒性的主流（Allman / Microsoft 预设都是 false，
+  # 只有 GNU 是 true）。
   BeforeWhile:           false
-  BeforeLambdaBody:      false   # lambda 体紧跟 ](){，换行反而把捕获和体割开
+  BeforeLambdaBody:      true
+  # ⚠️ 必须是 false。true 会把大括号**自己**再缩进一级（GNU 风格），
+  # 于是变成：
+  #     while (cond)
+  #         {
+  #             body;
+  #         }
+  # 八个官方预设里只有 GNU 用它，它不是"Allman 的一部分"——
+  # Allman / Microsoft 的 IndentBraces 都是 false。
   IndentBraces:          false
-  SplitEmptyFunction:    false   # void Tick() {} 允许压成一行
-  SplitEmptyRecord:      false
-  SplitEmptyNamespace:   false
+  SplitEmptyFunction:    false
+  SplitEmptyRecord:      true
+  SplitEmptyNamespace:   true
 
 # ---- 基本排版 --------------------------------------------------------------
 IndentWidth: 4

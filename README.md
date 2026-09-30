@@ -25,10 +25,13 @@ Origin/
 ├── CMakePresets.json       Windows 构建预设
 ├── src/                    全部 C++，两平台共享
 │   ├── main.cpp            SDL main callbacks + spdlog→SDL_Log 的 sink
-│   ├── VulkanRenderer.*    渲染逻辑 + ImGui 生命周期与面板
+│   ├── OriginRenderer.*    渲染逻辑 + ImGui 生命周期与面板
 │   ├── ShaderReflect.*     SPIR-V 反射 -> VkDescriptorSetLayout / VkPipelineLayout
-│   ├── Camera.*            轨道相机（纯数学，无输入/无 Vulkan）
-│   ├── CameraController.*  arcball 输入：鼠标 + 多点触摸
+│   ├── camera/             相机与控制器（两层抽象，纯数学，无 Vulkan）
+│   │   ├── Camera.{h,cpp}              抽象基类：位姿 + 投影 -> ViewProj()
+│   │   ├── PerspectiveCamera.{h,cpp}   透视投影
+│   │   ├── CameraController.{h,cpp}    抽象基类：输入 -> 位姿
+│   │   └── OrbitCameraController.{h,cpp} arcball：鼠标 + 多点触摸
 │   ├── GltfModel.*         glTF 导入（tinygltf v3，纯 CPU 侧）
 │   ├── Vertex.hpp          顶点格式（独立出来供导入器复用）
 │   ├── StbImage.cpp        stb_image 的唯一实现单元
@@ -319,7 +322,7 @@ llvm-readelf --program-headers \
 
 ## 为什么基线是 1.1 —— 一次被真机否掉的决策
 
-`src/VulkanRenderer.cpp` 里的 `kRequiredApiVersion` 是全工程唯一的版本真源，
+`src/OriginRenderer.cpp` 里的 `kRequiredApiVersion` 是全工程唯一的版本真源，
 instance / 设备过滤 / ImGui / VMA 四处都引用它。
 
 工程曾经把它定在 **1.3**，为的是 dynamic rendering + Synchronization2。
@@ -742,17 +745,115 @@ configure 必然早于任何打包任务。（build 阶段的增量重编也保�
 
 ---
 
-## 相机：Camera + CameraController
+## 相机：两层抽象
 
-两个类刻意分开，各自零依赖外扩：
+`src/camera/` 下是两条独立的继承链，各自零依赖外扩、都不含任何 Vulkan 调用：
 
-- **`Camera`**（`src/Camera.{hpp,cpp}`）纯数学，不含输入处理也不含任何 Vulkan 调用。
-- **`CameraController`**（`src/CameraController.{hpp,cpp}`）只把 SDL 事件翻译成 Camera 操作。
+```
+Camera（抽象）                    CameraController（抽象）
+  位姿 + 投影，产出 ViewProj()      输入事件 -> 相机位姿
+  └── PerspectiveCamera             └── OrbitCameraController
+      （未来：OrthographicCamera）      （未来：FpsCameraController）
+```
 
-状态用「目标点 + **朝向四元数** + 距离」而不是 yaw/pitch 欧拉角，理由有两条：
-arcball 的自然输出就是一个任意轴的旋转增量，四元数可直接左乘累积，
-用欧拉角必须先拆成 yaw/pitch，斜向拖动会失真；另外四元数没有万向锁，
-可以越过天顶继续转。
+### Camera 基类里**没有**什么
+
+这是这次抽象的核心决定。基类只保留所有相机类型共有的量（位姿 + aspect +
+裁剪面），两类东西被有意排除：
+
+- `fovY` 只属于透视、`orthoHeight` 只属于正交 → 各自的子类
+- **`target` / `distance` 不是相机的固有属性**，而是**轨道控制**的参数化方式
+  → `OrbitCameraController`
+
+旧版实现把 `target` / `distance` / `orbit` / `zoom` / `pan` 全塞进 `Camera`，
+结果"相机"这个概念被轨道交互绑死了 —— 想加 FPS 控制器（位置 + yaw/pitch）
+或做相机动画（直接喂位姿）都得改相机类。现在相机只回答"我在哪、朝哪看、
+怎么投影"。
+
+### 位姿用 position + world→view 四元数
+
+不用 `lookAt` 的三向量：position + orientation 直接对应 view 矩阵的两个组成
+部分，不需要每帧重新正交化，也不会出现 up 与视线共线时的退化。
+
+⚠️ `orientation` 的语义是 **world → view** 的旋转，不是"相机自身的朝向"。
+选这个方向是因为 `View()` 可以直接 `mat4_cast` 而不必取共轭 —— view 矩阵每帧
+都要算，而"相机前方"这类查询只在少数地方用。代价是 `Forward/Right/Up` 内部
+要取共轭，已经封装好了。
+
+用四元数而非 yaw/pitch 欧拉角：arcball 的自然输出就是一个任意轴的旋转增量，
+四元数可直接左乘累积，用欧拉角必须先拆成 yaw/pitch，斜向拖动会失真；
+另外四元数没有万向锁，可以越过天顶继续转。
+
+### 两个虚函数，各有明确理由
+
+**`ComputeProjection()`（protected 纯虚）+ `Proj()`（public 非虚）** ——
+NVI 模式，目的是把 Vulkan 的 Y 翻转收在**一个**地方：
+
+```cpp
+glm::mat4 Camera::Proj() const {
+    glm::mat4 p = ComputeProjection();  // 子类给标准 GL 风格（Y 朝上）
+    p[1][1] *= -1.0f;                   // 整个工程唯一做 Y 翻转的地方
+    return p;
+}
+```
+
+若让每个子类自己翻，新增一种相机时漏翻几乎必然发生 —— 而症状（画面倒置）
+看起来像是模型或视图矩阵错了，很容易查错方向。
+
+**`HalfExtentAtDistance(distance)`（public 纯虚）** ——
+距相机 `distance` 处垂直可见范围的一半。透视是 `distance * tan(fovY/2)`
+随距离线性增长，正交是与距离无关的常量。虚化它之后
+`OrbitCameraController::Pan` 完全不需要知道自己面对的是哪种投影：
+
+```cpp
+const float halfHeight = m_camera.HalfExtentAtDistance(m_distance);
+const float worldX     = dxNdc * halfHeight * m_camera.Aspect();
+```
+
+"抓住画面拖动"的手感在两种相机下都自动正确。`FrameBounds()`（按模型包围球
+自动取距离）也靠它反解 —— 在距离 1 处它返回的就是 `tan(fovY/2)`，
+于是 `radius / 它` 即为所需距离，整个函数里不出现一次 `tan`。
+
+### 轨道状态 → 相机位姿
+
+`OrbitCameraController::SyncCamera()` 是唯一的写入口，任何改动轨道状态的
+地方都必须在末尾调它：
+
+```cpp
+const glm::quat inv = glm::conjugate(m_rotation);
+m_camera.SetOrientation(m_rotation);
+m_camera.SetPosition(m_target + inv * glm::vec3(0.0f, 0.0f, m_distance));
+```
+
+与旧实现**数学等价**，只是状态归属换了地方：
+
+```
+旧： view = T(0,0,-d) · R(q) · T(-target)
+新： view = R(q) · T(-position)，  position = target + q⁻¹·(0,0,d)
+```
+
+展开后逐项相同（实测：bounds radius 1.645 的模型，两版都给出 distance 4.56）。
+
+### 没有做 dirty-flag 缓存
+
+`ViewProj()` 每次调用都重算。这是刻意的：缓存要靠每个子类在改参数后记得
+invalidate，而漏 invalidate 导致的"矩阵不更新"比多几次矩阵乘严重得多。
+正确用法是在绘制循环**外**取一次存局部变量 —— `recordCommandBuffer` 就是这么做的。
+
+### 渲染器持有相机与控制器
+
+不是由 `main.cpp` 注入。这是被顺序逼出来的：`createCubeMesh` 里加载完 glTF
+就要调 `FrameBounds` 设初始距离，而那时 `main.cpp` 还没机会创建控制器。
+旧版用 `setCameraController` 弱引用注入，于是"设初始距离"只能塞进 `Camera`
+（让相机类背上了轨道参数）。现在两者生命周期都归渲染器，`main.cpp` 只转发事件。
+
+手势映射（两端语义一致）：
+
+| Windows / 鼠标 | Android / 触摸 | 动作 |
+|---|---|---|
+| 左键拖动 | 单指拖动 | 旋转 |
+| 右/中键拖动 | 双指平移 | 平移 |
+| 滚轮 | 双指捏合 | 缩放 |
 
 手势映射（两端语义一致）：
 
@@ -789,7 +890,7 @@ if (event.motion.which == SDL_TOUCH_MOUSEID) return false;
 ## glTF 导入
 
 `src/GltfModel.{hpp,cpp}`，启动时加载 `assets/models/DamagedHelmet.glb`
-（换模型只改 `VulkanRenderer.cpp` 里的 `kModelAssetPath`）。
+（换模型只改 `OriginRenderer.cpp` 里的 `kModelAssetPath`）。
 加载失败会**退回内置 cube** 并打日志 —— 有退路时链路依然可见，
 不会黑屏让人分不清是资源问题还是渲染问题。
 
